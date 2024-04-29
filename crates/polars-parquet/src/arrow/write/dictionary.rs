@@ -67,7 +67,7 @@ pub(crate) fn encode_as_dictionary_optional(
         return Some(array_to_pages(
             array,
             type_,
-            &nested,
+            nested,
             options,
             Encoding::RleDictionary,
         ));
@@ -76,7 +76,7 @@ pub(crate) fn encode_as_dictionary_optional(
     Some(array_to_pages(
         array,
         type_,
-        &nested,
+        nested,
         options,
         Encoding::RleDictionary,
     ))

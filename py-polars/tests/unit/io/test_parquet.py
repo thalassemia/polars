@@ -892,3 +892,52 @@ def test_no_glob_windows(tmp_path: Path) -> None:
     df.write_parquet(str(p2))
 
     assert_frame_equal(pl.scan_parquet(str(p1), glob=False).collect(), df)
+
+
+def test_hybrid_rle() -> None:
+    df = pl.DataFrame(
+        {
+            # Test primitive types
+            "i64": pl.repeat(int(2**63 - 1), n=10, dtype=pl.Int64, eager=True),
+            "u64": pl.repeat(int(2**64 - 1), n=10, dtype=pl.UInt64, eager=True),
+            "i8": pl.repeat(-int(2**7 - 1), n=10, dtype=pl.Int8, eager=True),
+            "u8": pl.repeat(int(2**8 - 1), n=10, dtype=pl.UInt8, eager=True),
+            "string": pl.repeat("a", n=10, dtype=pl.String, eager=True),
+            "categorical": pl.Series(["a"] * 9 + ["b"], dtype=pl.Categorical),
+            # Test nested types with and without nulls
+            "double_nested": pl.repeat(
+                [[1]], n=10, dtype=pl.List(pl.List(pl.UInt8)), eager=True
+            ),
+            "double_nested_nulls": [[[1]] * 9 + [[2]] * 2] * 6
+            + [None] * 3
+            + [[None] + [[None]] + [[1]] * 9],
+            "struct_nulls": [{f"s_{i}": [1] for i in range(10)}] * 4
+            + [{f"s_{i}": [0] for i in range(9)}]
+            + [{f"s_{i}": [1] for i in range(10)}] * 5,
+            # Test filling up bit-packing buffer
+            "large_bit_pack": [np.random.randint(0, 2**63, (4000)) for i in range(3)]
+            + [[0] * 10000] * 6
+            + [np.random.randint(0, 2**63, (10000))],
+            # Test mix of bit-packed and RLE runs
+            "bit_pack_and_rle": [[0] + [1] * 8 + [2] * 9 + [3] + [4] * 8] * 10,
+        }
+    )
+    f = io.BytesIO()
+    df.write_parquet(f)
+    f.seek(0)
+    for column in pq.ParquetFile(f).metadata.to_dict()["row_groups"][0]["columns"]:
+        assert "RLE_DICTIONARY" in column["encodings"]
+    f.seek(0)
+    assert_frame_equal(pl.read_parquet(f), df)
+
+    df = pl.DataFrame(
+        {
+            # Test filling up bit-packing buffer for encode_bool
+            # Only used to encode validities for non-nested arrays
+            "large_bit_pack_validity": [0, None] * 5000
+            + [0]
+            + [0, None] * 5000
+            + [0] * 1000
+        }
+    )
+    test_round_trip(df)
