@@ -21,18 +21,14 @@ use crate::parquet::encoding::Encoding;
 use crate::parquet::page::{DictPage, Page};
 use crate::parquet::schema::types::PrimitiveType;
 use crate::parquet::statistics::{serialize_statistics, ParquetStatistics};
-use crate::write::{to_nested, DynIter, ParquetType};
+use crate::write::DynIter;
 
 pub(crate) fn encode_as_dictionary_optional(
     array: &dyn Array,
+    nested: &[Nested],
     type_: PrimitiveType,
     options: WriteOptions,
 ) -> Option<PolarsResult<DynIter<'static, PolarsResult<Page>>>> {
-    let nested = to_nested(array, &ParquetType::PrimitiveType(type_.clone()))
-        .ok()?
-        .pop()
-        .unwrap();
-
     let dtype = Box::new(array.data_type().clone());
 
     let len_before = array.len();
