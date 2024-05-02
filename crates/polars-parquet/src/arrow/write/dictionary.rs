@@ -27,6 +27,8 @@ pub(crate) fn encode_as_dictionary_optional(
     nested: &[Nested],
     type_: PrimitiveType,
     options: WriteOptions,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> Option<PolarsResult<DynIter<'static, PolarsResult<Page>>>> {
     let dtype = Box::new(array.data_type().clone());
 
@@ -54,6 +56,8 @@ pub(crate) fn encode_as_dictionary_optional(
         nested,
         options,
         Encoding::RleDictionary,
+        def_levels,
+        rep_levels
     ))
 }
 
@@ -106,6 +110,8 @@ fn serialize_levels(
     nested: &[Nested],
     options: WriteOptions,
     buffer: &mut Vec<u8>,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<(usize, usize)> {
     if nested.len() == 1 {
         let is_optional = is_nullable(&type_.field_info);
@@ -113,7 +119,7 @@ fn serialize_levels(
         let definition_levels_byte_length = buffer.len();
         Ok((0, definition_levels_byte_length))
     } else {
-        nested::write_rep_and_def(options.version, nested, buffer)
+        nested::write_rep_and_def(options.version, nested, buffer, def_levels, rep_levels)
     }
 }
 
@@ -135,6 +141,8 @@ fn serialize_keys<K: DictionaryKey>(
     nested: &[Nested],
     statistics: Option<ParquetStatistics>,
     options: WriteOptions,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<Page> {
     let mut buffer = vec![];
 
@@ -159,6 +167,8 @@ fn serialize_keys<K: DictionaryKey>(
         &nested,
         options,
         &mut buffer,
+        def_levels,
+        rep_levels
     )?;
 
     serialize_keys_values(&array, validity.as_ref(), &mut buffer)?;
@@ -208,6 +218,8 @@ pub fn array_to_pages<K: DictionaryKey>(
     nested: &[Nested],
     options: WriteOptions,
     encoding: Encoding,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<DynIter<'static, PolarsResult<Page>>> {
     match encoding {
         Encoding::PlainDictionary | Encoding::RleDictionary => {
@@ -318,7 +330,7 @@ pub fn array_to_pages<K: DictionaryKey>(
 
             // write DataPage pointing to DictPage
             let data_page =
-                serialize_keys(array, type_, nested, statistics, options)?.unwrap_data();
+                serialize_keys(array, type_, nested, statistics, options, def_levels, rep_levels)?.unwrap_data();
 
             Ok(DynIter::new(
                 [Page::Dict(dict_page), Page::Data(data_page)]

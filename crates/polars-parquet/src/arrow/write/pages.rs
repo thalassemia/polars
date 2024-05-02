@@ -1,3 +1,4 @@
+use std::iter;
 use std::fmt::Debug;
 
 use arrow::array::{Array, FixedSizeListArray, ListArray, MapArray, StructArray};
@@ -11,6 +12,319 @@ use crate::arrow::read::schema::is_nullable;
 use crate::parquet::page::Page;
 use crate::parquet::schema::types::{ParquetType, PrimitiveType as ParquetPrimitiveType};
 use crate::write::DynIter;
+
+pub fn def_level_iter_from_validity(
+    def_level: u32,
+    bitmap: &Bitmap
+)-> impl Iterator<Item = u32> {
+    let def_iter = iter::repeat(def_level);
+    return bitmap.clone().into_iter()
+        .zip(def_iter)
+        .map(|(is_valid, def_null)| def_null + is_valid as u32)
+        .take(bitmap.len());
+}
+
+pub fn make_rep_level_iter(
+    rep_level: u32,
+    parent_level: u32,
+    length: usize
+) -> impl Iterator<Item = u32> {
+    iter::repeat(parent_level)
+        .take(1)
+        .chain(iter::repeat(rep_level).take(length - 1))
+}
+
+/// Constructs iterators for rep and def levels of `array`
+pub fn to_levels(array: &dyn Array, type_: &ParquetType
+) -> PolarsResult<(Vec<u32>, Vec<u32>)> {
+    let mut def_levels = vec![];
+    let mut rep_levels = vec![];
+
+    to_levels_recursive(array, type_, &mut def_levels, &mut rep_levels, 0, 0)?;
+    Ok((def_levels, rep_levels))
+}
+
+fn to_levels_recursive(
+    array: &dyn Array,
+    type_: &ParquetType,
+    def_levels: &mut Vec<u32>,
+    rep_levels: &mut Vec<u32>,
+    current_level: u32,
+    parent_level: u32
+) -> PolarsResult<()> {
+    let is_optional = is_nullable(type_.get_field_info()) as u32;
+
+    use PhysicalType::*;
+    match array.data_type().to_physical_type() {
+        Struct => {
+            let array = array.as_any().downcast_ref::<StructArray>().unwrap();
+            let fields = if let ParquetType::GroupType { fields, .. } = type_ {
+                fields
+            } else {
+                polars_bail!(InvalidOperation:
+                    "Parquet type must be a group for a struct array".to_string(),
+                )
+            };
+
+            let next_level = current_level + is_optional;
+            // Fields may be nullable if array has bitmap
+            if let Some(bitmap) = array.validity() {
+                let mut zipped_iter = bitmap.iter().zip(fields.iter().zip(array.values()));
+                // First inner field has definition level equal to current level + 1 if not null
+                // or current level if null and repetition level equal to parent level
+                if let Some((true, (type_, array))) = zipped_iter.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                } else {
+                    def_levels.push(current_level);
+                    rep_levels.push(parent_level);
+                }
+                // After first element, parent level (repetition level) becomes current level
+                for (is_valid, (type_, array)) in zipped_iter {
+                    if is_valid {
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                    } else {
+                        def_levels.push(current_level);
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                // All fields are defined so we can use same logic as above
+                // without needing to account for nulls
+                let mut subfields = fields.iter().zip(array.values());
+                if let Some((type_, array)) = subfields.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                }
+                let new_parent_level = current_level;
+                for (type_, array) in subfields {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                }
+            }
+        },
+        FixedSizeList => {
+            let array = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let type_ = if let ParquetType::GroupType { fields, .. } = type_ {
+                if let ParquetType::GroupType { fields, .. } = &fields[0] {
+                    &fields[0]
+                } else {
+                    polars_bail!(InvalidOperation:
+                        "Parquet type must be a group for a list array".to_string(),
+                    )
+                }
+            } else {
+                polars_bail!(InvalidOperation:
+                    "Parquet type must be a group for a list array".to_string(),
+                )
+            };
+
+            let next_level = current_level + is_optional;
+            // Fields may be nullable if array has bitmap
+            if let Some(bitmap) = array.validity() {
+                let mut zipped_iter = bitmap.iter()
+                    .zip((0..array.len()).map(|idx| array.value(idx)));
+                // First inner field has definition level equal to current level + 1 if not null
+                // or current level if null and repetition level equal to parent level
+                if let Some((true, array)) = zipped_iter.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                } else {
+                    def_levels.push(current_level);
+                    rep_levels.push(parent_level);
+                }
+                // After first element, parent level (repetition level) becomes current level
+                for (is_valid, array) in zipped_iter {
+                    if is_valid {
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                    } else {
+                        def_levels.push(current_level);
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                // All fields are defined so we can use same logic as above
+                // without needing to account for nulls
+                let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
+                if let Some(array) = subarrays.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                }
+                let new_parent_level = current_level;
+                for array in subarrays {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                }
+            }
+        },
+        List => {
+            let array = array.as_any().downcast_ref::<ListArray<i32>>().unwrap();
+            let type_ = if let ParquetType::GroupType { fields, .. } = type_ {
+                if let ParquetType::GroupType { fields, .. } = &fields[0] {
+                    &fields[0]
+                } else {
+                    polars_bail!(InvalidOperation:
+                        "Parquet type must be a group for a list array".to_string(),
+                    )
+                }
+            } else {
+                polars_bail!(InvalidOperation:
+                    "Parquet type must be a group for a list array".to_string(),
+                )
+            };
+
+            let next_level = current_level + is_optional;
+            // Fields may be nullable if array has bitmap
+            if let Some(bitmap) = array.validity() {
+                let mut zipped_iter = bitmap.iter()
+                    .zip((0..array.len()).map(|idx| array.value(idx)));
+                // First inner field has definition level equal to current level + 1 if not null
+                // or current level if null and repetition level equal to parent level
+                if let Some((true, array)) = zipped_iter.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                } else {
+                    def_levels.push(current_level);
+                    rep_levels.push(parent_level);
+                }
+                // After first element, parent level (repetition level) becomes current level
+                for (is_valid, array) in zipped_iter {
+                    if is_valid {
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                    } else {
+                        def_levels.push(current_level);
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                // All fields are defined so we can use same logic as above
+                // without needing to account for nulls
+                let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
+                if let Some(array) = subarrays.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                }
+                let new_parent_level = current_level;
+                for array in subarrays {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                }
+            }
+        },
+        LargeList => {
+            let array = array.as_any().downcast_ref::<ListArray<i64>>().unwrap();
+            let type_ = if let ParquetType::GroupType { fields, .. } = type_ {
+                if let ParquetType::GroupType { fields, .. } = &fields[0] {
+                    &fields[0]
+                } else {
+                    polars_bail!(InvalidOperation:
+                        "Parquet type must be a group for a list array".to_string(),
+                    )
+                }
+            } else {
+                polars_bail!(InvalidOperation:
+                    "Parquet type must be a group for a list array".to_string(),
+                )
+            };
+            
+            let next_level = current_level + is_optional;
+            // Fields may be nullable if array has bitmap
+            if let Some(bitmap) = array.validity() {
+                let mut zipped_iter = bitmap.iter()
+                    .zip((0..array.len()).map(|idx| array.value(idx)));
+                // First inner field has definition level equal to current level + 1 if not null
+                // or current level if null and repetition level equal to parent level
+                if let Some((true, array)) = zipped_iter.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                } else {
+                    def_levels.push(current_level);
+                    rep_levels.push(parent_level);
+                }
+                // After first element, parent level (repetition level) becomes current level
+                for (is_valid, array) in zipped_iter {
+                    if is_valid {
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                    } else {
+                        def_levels.push(current_level);
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                // All fields are defined so we can use same logic as above
+                // without needing to account for nulls
+                let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
+                if let Some(array) = subarrays.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                }
+                let new_parent_level = current_level;
+                for array in subarrays {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                }
+            }
+        },
+        Map => {
+            let array = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let type_ = if let ParquetType::GroupType { fields, .. } = type_ {
+                if let ParquetType::GroupType { fields, .. } = &fields[0] {
+                    &fields[0]
+                } else {
+                    polars_bail!(InvalidOperation:
+                        "Parquet type must be a group for a map array".to_string(),
+                    )
+                }
+            } else {
+                polars_bail!(InvalidOperation:
+                    "Parquet type must be a group for a map array".to_string(),
+                )
+            };
+
+            let next_level = current_level + is_optional;
+            // Fields may be nullable if array has bitmap
+            if let Some(bitmap) = array.validity() {
+                let mut zipped_iter = bitmap.iter()
+                    .zip((0..array.len()).map(|idx| array.value(idx)));
+                // First inner field has definition level equal to current level + 1 if not null
+                // or current level if null and repetition level equal to parent level
+                if let Some((true, array)) = zipped_iter.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                } else {
+                    def_levels.push(current_level);
+                    rep_levels.push(parent_level);
+                }
+                // After first element, parent level (repetition level) becomes current level
+                for (is_valid, array) in zipped_iter {
+                    if is_valid {
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                    } else {
+                        def_levels.push(current_level);
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                // All fields are not defined so we can use same logic as above
+                // without needing to account for nulls
+                let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
+                if let Some(array) = subarrays.next() {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                }
+                let new_parent_level = current_level;
+                for array in subarrays {
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                }
+            }
+        },
+        _ => {
+            match array.validity() {
+                Some(bitmap) => {
+                    def_levels.extend(
+                        def_level_iter_from_validity(
+                            current_level,
+                            bitmap));
+                }
+                None => {
+                    def_levels.extend(iter::repeat(current_level + is_optional).take(array.len()));
+                }
+            }
+            rep_levels.extend(
+                make_rep_level_iter(
+                    current_level,
+                    parent_level,
+                    array.len()));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListNested<O: Offset> {
@@ -278,6 +592,15 @@ pub fn array_to_columns<A: AsRef<dyn Array> + Send + Sync>(
     let array = array.as_ref();
     let nested = to_nested(array, &type_)?;
 
+    let (def_levels, rep_levels) = to_levels(array, &type_)?;
+
+    for i in 0..22 {
+        println!("{} {}",
+            def_levels[i],
+            rep_levels[i]
+            );
+    }
+
     let types = to_parquet_leaves(type_);
 
     let values = to_leaves(array);
@@ -290,7 +613,7 @@ pub fn array_to_columns<A: AsRef<dyn Array> + Send + Sync>(
         .zip(types)
         .zip(encoding.iter())
         .map(|(((values, nested), type_), encoding)| {
-            array_to_pages(*values, type_, &nested, options, *encoding)
+            array_to_pages(*values, type_, &nested, options, *encoding, &def_levels, &rep_levels)
         })
         .collect()
 }

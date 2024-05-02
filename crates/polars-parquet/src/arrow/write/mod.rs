@@ -202,6 +202,8 @@ pub fn array_to_pages(
     nested: &[Nested],
     options: WriteOptions,
     mut encoding: Encoding,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<DynIter<'static, PolarsResult<Page>>> {
     if let ArrowDataType::Dictionary(key_type, _, _) = primitive_array.data_type().to_logical_type()
     {
@@ -212,12 +214,14 @@ pub fn array_to_pages(
                 &nested,
                 options,
                 encoding,
+                def_levels,
+                rep_levels
             )
         });
     };
     if let Encoding::RleDictionary = encoding {
         if let Some(result) =
-            encode_as_dictionary_optional(primitive_array, nested, type_.clone(), options)
+            encode_as_dictionary_optional(primitive_array, nested, type_.clone(), options, def_levels, rep_levels)
         {
             return result;
         }
@@ -257,9 +261,13 @@ pub fn array_to_pages(
 
     let primitive_array = primitive_array.to_boxed();
 
+    let right_def_levels = def_levels.clone();
+    let right_rep_levels = rep_levels.clone();
+
     let pages = row_iter.map(move |(offset, length)| {
         let mut right_array = primitive_array.clone();
         let mut right_nested = nested.clone();
+        
         slice_parquet_array(right_array.as_mut(), &mut right_nested, offset, length);
 
         array_to_page(
@@ -268,6 +276,8 @@ pub fn array_to_pages(
             &right_nested,
             options,
             encoding,
+            &right_def_levels,
+            &right_rep_levels
         )
     });
     Ok(DynIter::new(pages))
@@ -280,12 +290,14 @@ pub fn array_to_page(
     nested: &[Nested],
     options: WriteOptions,
     encoding: Encoding,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<Page> {
     if nested.len() == 1 {
         // special case where validity == def levels
         return array_to_page_simple(array, type_, options, encoding);
     }
-    array_to_page_nested(array, type_, nested, options, encoding)
+    array_to_page_nested(array, type_, nested, options, encoding, def_levels, rep_levels)
 }
 
 /// Converts an [`Array`] to a [`CompressedPage`] based on options, descriptor and `encoding`.
@@ -640,75 +652,77 @@ fn array_to_page_nested(
     nested: &[Nested],
     options: WriteOptions,
     _encoding: Encoding,
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<Page> {
     use ArrowDataType::*;
     match array.data_type().to_logical_type() {
         Null => {
             let array = Int32Array::new_null(ArrowDataType::Int32, array.len());
-            primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested)
+            primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested, def_levels, rep_levels)
         },
         Boolean => {
             let array = array.as_any().downcast_ref().unwrap();
-            boolean::nested_array_to_page(array, options, type_, nested)
+            boolean::nested_array_to_page(array, options, type_, nested, def_levels, rep_levels)
         },
         LargeUtf8 => {
             let array =
                 arrow::compute::cast::cast(array, &LargeBinary, Default::default()).unwrap();
             let array = array.as_any().downcast_ref().unwrap();
-            binary::nested_array_to_page::<i64>(array, options, type_, nested)
+            binary::nested_array_to_page::<i64>(array, options, type_, nested, def_levels, rep_levels)
         },
         LargeBinary => {
             let array = array.as_any().downcast_ref().unwrap();
-            binary::nested_array_to_page::<i64>(array, options, type_, nested)
+            binary::nested_array_to_page::<i64>(array, options, type_, nested, def_levels, rep_levels)
         },
         BinaryView => {
             let array = array.as_any().downcast_ref().unwrap();
-            binview::nested_array_to_page(array, options, type_, nested)
+            binview::nested_array_to_page(array, options, type_, nested, def_levels, rep_levels)
         },
         Utf8View => {
             let array = arrow::compute::cast::cast(array, &BinaryView, Default::default()).unwrap();
             let array = array.as_any().downcast_ref().unwrap();
-            binview::nested_array_to_page(array, options, type_, nested)
+            binview::nested_array_to_page(array, options, type_, nested, def_levels, rep_levels)
         },
         UInt8 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<u8, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<u8, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         UInt16 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<u16, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<u16, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         UInt32 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<u32, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<u32, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         UInt64 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<u64, i64>(array, options, type_, nested)
+            primitive::nested_array_to_page::<u64, i64>(array, options, type_, nested, def_levels, rep_levels)
         },
         Int8 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<i8, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<i8, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         Int16 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<i16, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<i16, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         Int32 | Date32 | Time32(_) => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<i32, i32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<i32, i32>(array, options, type_, nested, def_levels, rep_levels)
         },
         Int64 | Date64 | Time64(_) | Timestamp(_, _) | Duration(_) => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<i64, i64>(array, options, type_, nested)
+            primitive::nested_array_to_page::<i64, i64>(array, options, type_, nested, def_levels, rep_levels)
         },
         Float32 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<f32, f32>(array, options, type_, nested)
+            primitive::nested_array_to_page::<f32, f32>(array, options, type_, nested, def_levels, rep_levels)
         },
         Float64 => {
             let array = array.as_any().downcast_ref().unwrap();
-            primitive::nested_array_to_page::<f64, f64>(array, options, type_, nested)
+            primitive::nested_array_to_page::<f64, f64>(array, options, type_, nested, def_levels, rep_levels)
         },
         Decimal(precision, _) => {
             let precision = *precision;
@@ -729,7 +743,7 @@ fn array_to_page_nested(
                     values,
                     array.validity().cloned(),
                 );
-                primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested)
+                primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested, def_levels, rep_levels)
             } else if precision <= 18 {
                 let values = array
                     .values()
@@ -743,7 +757,7 @@ fn array_to_page_nested(
                     values,
                     array.validity().cloned(),
                 );
-                primitive::nested_array_to_page::<i64, i64>(&array, options, type_, nested)
+                primitive::nested_array_to_page::<i64, i64>(&array, options, type_, nested, def_levels, rep_levels)
             } else {
                 let size = decimal_length_from_precision(precision);
 
@@ -787,7 +801,7 @@ fn array_to_page_nested(
                     values,
                     array.validity().cloned(),
                 );
-                primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested)
+                primitive::nested_array_to_page::<i32, i32>(&array, options, type_, nested, def_levels, rep_levels)
             } else if precision <= 18 {
                 let values = array
                     .values()
@@ -801,7 +815,7 @@ fn array_to_page_nested(
                     values,
                     array.validity().cloned(),
                 );
-                primitive::nested_array_to_page::<i64, i64>(&array, options, type_, nested)
+                primitive::nested_array_to_page::<i64, i64>(&array, options, type_, nested, def_levels, rep_levels)
             } else if precision <= 38 {
                 let size = decimal_length_from_precision(precision);
                 let statistics = if options.write_statistics {
