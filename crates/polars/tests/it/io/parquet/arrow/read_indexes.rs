@@ -35,6 +35,7 @@ fn pages(
         data_pagesize_limit: None,
     };
 
+    let levels: Vec<u32> = vec![];
     let pages1 = [array11, array12, array13]
         .into_iter()
         .map(|array| {
@@ -47,6 +48,8 @@ fn pages(
                 &[Nested::Primitive(None, true, array.len())],
                 options,
                 Encoding::Plain,
+                &levels,
+                &levels
             )
         })
         .collect::<PolarsResult<Vec<_>>>()?;
@@ -63,6 +66,8 @@ fn pages(
                 &[Nested::Primitive(None, true, array.len())],
                 options,
                 encoding,
+                &levels,
+                &levels
             )
             .unwrap()
             .collect::<PolarsResult<Vec<_>>>()

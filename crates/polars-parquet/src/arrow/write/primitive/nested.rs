@@ -17,6 +17,8 @@ pub fn array_to_page<T, R>(
     options: WriteOptions,
     type_: PrimitiveType,
     nested: &[Nested],
+    def_levels: &Vec<u32>,
+    rep_levels: &Vec<u32>
 ) -> PolarsResult<DataPage>
 where
     T: ArrowNativeType,
@@ -28,7 +30,7 @@ where
     let mut buffer = vec![];
 
     let (repetition_levels_byte_length, definition_levels_byte_length) =
-        nested::write_rep_and_def(options.version, nested, &mut buffer)?;
+        nested::write_rep_and_def(options.version, nested, &mut buffer, def_levels, rep_levels)?;
 
     let buffer = encode_plain(array, is_optional, buffer);
 
