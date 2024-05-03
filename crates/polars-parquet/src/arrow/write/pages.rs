@@ -31,7 +31,7 @@ pub fn make_rep_level_iter(
 ) -> impl Iterator<Item = u32> {
     iter::repeat(parent_level)
         .take(1)
-        .chain(iter::repeat(rep_level).take(length - 1))
+        .chain(iter::repeat(rep_level).take(length.saturating_sub(1)))
 }
 
 /// Constructs iterators for rep and def levels of `array`
@@ -40,7 +40,7 @@ pub fn to_levels(array: &dyn Array, type_: &ParquetType
     let mut def_levels = vec![];
     let mut rep_levels = vec![];
 
-    to_levels_recursive(array, type_, &mut def_levels, &mut rep_levels, 0, 0)?;
+    to_levels_recursive(array, type_, &mut def_levels, &mut rep_levels, 0, 0, 0)?;
     Ok((def_levels, rep_levels))
 }
 
@@ -50,7 +50,8 @@ fn to_levels_recursive(
     def_levels: &mut Vec<u32>,
     rep_levels: &mut Vec<u32>,
     current_level: u32,
-    parent_level: u32
+    parent_level: u32,
+    validity_bonus: u32
 ) -> PolarsResult<()> {
     let is_optional = is_nullable(type_.get_field_info()) as u32;
 
@@ -73,30 +74,33 @@ fn to_levels_recursive(
                 // First inner field has definition level equal to current level + 1 if not null
                 // or current level if null and repetition level equal to parent level
                 if let Some((true, (type_, array))) = zipped_iter.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 } else {
-                    def_levels.push(current_level);
+                    def_levels.push(current_level + validity_bonus);
                     rep_levels.push(parent_level);
                 }
                 // After first element, parent level (repetition level) becomes current level
                 for (is_valid, (type_, array)) in zipped_iter {
                     if is_valid {
-                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level, validity_bonus + is_optional)?;
                     } else {
-                        def_levels.push(current_level);
+                        def_levels.push(current_level + validity_bonus);
                         rep_levels.push(current_level);
                     }
                 }
+            }  else if array.len() == 0 {
+                def_levels.push(current_level + validity_bonus);
+                rep_levels.push(parent_level);
             } else {
                 // All fields are defined so we can use same logic as above
                 // without needing to account for nulls
                 let mut subfields = fields.iter().zip(array.values());
                 if let Some((type_, array)) = subfields.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 }
                 let new_parent_level = current_level;
                 for (type_, array) in subfields {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level, validity_bonus + is_optional)?;
                 }
             }
         },
@@ -124,30 +128,33 @@ fn to_levels_recursive(
                 // First inner field has definition level equal to current level + 1 if not null
                 // or current level if null and repetition level equal to parent level
                 if let Some((true, array)) = zipped_iter.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 } else {
-                    def_levels.push(current_level);
+                    def_levels.push(current_level + validity_bonus);
                     rep_levels.push(parent_level);
                 }
                 // After first element, parent level (repetition level) becomes current level
                 for (is_valid, array) in zipped_iter {
                     if is_valid {
-                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level, validity_bonus + is_optional)?;
                     } else {
-                        def_levels.push(current_level);
+                        def_levels.push(current_level + validity_bonus);
                         rep_levels.push(current_level);
                     }
                 }
+            } else if array.len() == 0 {
+                def_levels.push(current_level + validity_bonus);
+                rep_levels.push(parent_level);
             } else {
                 // All fields are defined so we can use same logic as above
                 // without needing to account for nulls
                 let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
                 if let Some(array) = subarrays.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 }
                 let new_parent_level = current_level;
                 for array in subarrays {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level, validity_bonus + is_optional)?;
                 }
             }
         },
@@ -175,30 +182,33 @@ fn to_levels_recursive(
                 // First inner field has definition level equal to current level + 1 if not null
                 // or current level if null and repetition level equal to parent level
                 if let Some((true, array)) = zipped_iter.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 } else {
-                    def_levels.push(current_level);
+                    def_levels.push(current_level + validity_bonus);
                     rep_levels.push(parent_level);
                 }
                 // After first element, parent level (repetition level) becomes current level
                 for (is_valid, array) in zipped_iter {
                     if is_valid {
-                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level, validity_bonus + is_optional)?;
                     } else {
-                        def_levels.push(current_level);
+                        def_levels.push(current_level + validity_bonus);
                         rep_levels.push(current_level);
                     }
                 }
+            } else if array.len() == 0 {
+                def_levels.push(current_level + validity_bonus);
+                rep_levels.push(parent_level);
             } else {
                 // All fields are defined so we can use same logic as above
                 // without needing to account for nulls
                 let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
                 if let Some(array) = subarrays.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 }
                 let new_parent_level = current_level;
                 for array in subarrays {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level, validity_bonus + is_optional)?;
                 }
             }
         },
@@ -226,30 +236,33 @@ fn to_levels_recursive(
                 // First inner field has definition level equal to current level + 1 if not null
                 // or current level if null and repetition level equal to parent level
                 if let Some((true, array)) = zipped_iter.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 } else {
-                    def_levels.push(current_level);
+                    def_levels.push(current_level + validity_bonus);
                     rep_levels.push(parent_level);
                 }
                 // After first element, parent level (repetition level) becomes current level
                 for (is_valid, array) in zipped_iter {
                     if is_valid {
-                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level, validity_bonus + is_optional)?;
                     } else {
-                        def_levels.push(current_level);
+                        def_levels.push(current_level + validity_bonus);
                         rep_levels.push(current_level);
                     }
                 }
+            } else if array.len() == 0 {
+                def_levels.push(current_level + validity_bonus);
+                rep_levels.push(parent_level);
             } else {
                 // All fields are defined so we can use same logic as above
                 // without needing to account for nulls
                 let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
                 if let Some(array) = subarrays.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 }
                 let new_parent_level = current_level;
                 for array in subarrays {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level, validity_bonus + is_optional)?;
                 }
             }
         },
@@ -277,30 +290,33 @@ fn to_levels_recursive(
                 // First inner field has definition level equal to current level + 1 if not null
                 // or current level if null and repetition level equal to parent level
                 if let Some((true, array)) = zipped_iter.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 } else {
-                    def_levels.push(current_level);
+                    def_levels.push(current_level + validity_bonus);
                     rep_levels.push(parent_level);
                 }
                 // After first element, parent level (repetition level) becomes current level
                 for (is_valid, array) in zipped_iter {
                     if is_valid {
-                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level)?;
+                        to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, current_level, validity_bonus + is_optional)?;
                     } else {
-                        def_levels.push(current_level);
+                        def_levels.push(current_level + validity_bonus);
                         rep_levels.push(current_level);
                     }
                 }
+            } else if array.len() == 0 {
+                def_levels.push(current_level + validity_bonus);
+                rep_levels.push(parent_level);
             } else {
-                // All fields are not defined so we can use same logic as above
+                // All fields are defined so we can use same logic as above
                 // without needing to account for nulls
                 let mut subarrays = (0..array.len()).map(|idx| array.value(idx));
                 if let Some(array) = subarrays.next() {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, parent_level, validity_bonus + is_optional)?;
                 }
                 let new_parent_level = current_level;
                 for array in subarrays {
-                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level)?;
+                    to_levels_recursive(array.as_ref(), type_, def_levels, rep_levels, next_level, new_parent_level, validity_bonus + is_optional)?;
                 }
             }
         },
@@ -309,11 +325,15 @@ fn to_levels_recursive(
                 Some(bitmap) => {
                     def_levels.extend(
                         def_level_iter_from_validity(
-                            current_level,
+                            current_level + validity_bonus,
                             bitmap));
                 }
                 None => {
-                    def_levels.extend(iter::repeat(current_level + is_optional).take(array.len()));
+                    if array.len() == 0 {
+                        def_levels.extend(iter::repeat(current_level + validity_bonus).take(1));
+                    } else {
+                        def_levels.extend(iter::repeat(current_level + is_optional + validity_bonus).take(array.len()));
+                    }
                 }
             }
             rep_levels.extend(
@@ -593,13 +613,6 @@ pub fn array_to_columns<A: AsRef<dyn Array> + Send + Sync>(
     let nested = to_nested(array, &type_)?;
 
     let (def_levels, rep_levels) = to_levels(array, &type_)?;
-
-    for i in 0..22 {
-        println!("{} {}",
-            def_levels[i],
-            rep_levels[i]
-            );
-    }
 
     let types = to_parquet_leaves(type_);
 
