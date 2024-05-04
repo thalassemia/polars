@@ -1,9 +1,9 @@
-use polars_utils::slice::GetSaferUnchecked;
+use arrow::bitmap::utils::BitmapIter;
 
 use super::super::pages::Nested;
 use super::to_length;
 
-trait DebugIter: Iterator<Item = usize> + std::fmt::Debug {}
+pub trait DebugIter: Iterator<Item = usize> + std::fmt::Debug {}
 
 impl<A: Iterator<Item = usize> + std::fmt::Debug> DebugIter for A {}
 
@@ -44,24 +44,34 @@ pub fn num_values(nested: &[Nested]) -> usize {
         + pr
 }
 
+/// Store information about recursive stack
+#[derive(Debug)]
+pub struct StackState<'a> {
+    // current repetition level
+    pub current_level: u32,
+    // add to current level to get definition level
+    pub validity_bonus: u32,
+    // iterator over lengths of inner values
+    pub lengths: Box<dyn DebugIter + 'a>,
+    // validity iterator (only for leaf primitive arrays)
+    pub validity: Option<BitmapIter<'a>>,
+    pub is_primitive: bool,
+    pub is_optional: u32,
+    // calculate def level differently for structs
+    pub is_struct: bool,
+    // remaining length of current inner value
+    pub current_length: usize,
+    // total inner values processed
+    pub total_processed: usize,
+}
+
 /// Iterator adapter of parquet / dremel repetition levels
 #[derive(Debug)]
 pub struct RepLevelsIter<'a> {
-    // iterators of lengths. E.g. [[[a,b,c], [d,e,f,g]], [[h], [i,j]]] -> [[2, 2], [3, 4, 1, 2]]
-    iter: Vec<Box<dyn DebugIter + 'a>>,
-    // vector containing the remaining number of values of each iterator.
-    // e.g. the iters [[2, 2], [3, 4, 1, 2]] after the first iteration will return [2, 3],
-    // and remaining will be [2, 3].
-    // on the second iteration, it will be `[2, 2]` (since iterations consume the last items)
-    remaining: Vec<usize>, /* < remaining.len() == iter.len() */
-    // cache of the first `remaining` that is non-zero. Examples:
-    // * `remaining = [2, 2] => current_level = 2`
-    // * `remaining = [2, 0] => current_level = 1`
-    // * `remaining = [0, 0] => current_level = 0`
-    current_level: usize, /* < iter.len() */
-    // the number to discount due to being the first element of the iterators.
-    total: usize, /* < iter.len() */
-
+    // current stack for recursion
+    stack: Vec<StackState<'a>>,
+    // current location on stack
+    stack_idx: usize,
     // the total number of items that this iterator will return
     remaining_values: usize,
 }
@@ -70,14 +80,111 @@ impl<'a> RepLevelsIter<'a> {
     pub fn new(nested: &'a [Nested]) -> Self {
         let remaining_values = num_values(nested);
 
-        let iter = iter(nested);
-        let remaining = vec![0; iter.len()];
+        // Add root node to stack
+        let mut stack = vec![];
+        let mut current_level = 0;
+        let mut validity_bonus = 0;
+        stack.push(
+            StackState {
+                current_level,
+                validity_bonus,
+                lengths: Box::new(std::iter::empty()),
+                validity: None,
+                is_primitive: false,
+                is_optional: 0,
+                is_struct: false,
+                current_length: nested[0].len(),
+                total_processed: 0
+            }
+        );
+        for curr_nested in nested {
+            match curr_nested {
+                Nested::Primitive(validity, is_optional, len) => {
+                    let validity_iter;
+                    if let Some(validity) = validity {
+                        validity_iter = Some(validity.iter());
+                    } else {
+                        validity_iter = None;
+                    }
+                    stack.push(
+                        StackState {
+                            current_level,
+                            validity_bonus,
+                            lengths: Box::new(std::iter::empty()),
+                            validity: validity_iter,
+                            is_primitive: true,
+                            is_optional: *is_optional as u32,
+                            is_struct: false,
+                            current_length: *len,
+                            total_processed: 0,
+                        }
+                    );
+                }
+                Nested::List(nested) => {
+                    current_level += nested.is_optional as u32;
+                    validity_bonus += 1;
+                    let mut length_iter = to_length(&nested.offsets);
+                    let current_length = length_iter.next().unwrap_or(0);
+                    stack.push(
+                        StackState {
+                            current_level,
+                            validity_bonus,
+                            lengths: Box::new(length_iter),
+                            validity: None,
+                            is_primitive: false,
+                            is_optional: nested.is_optional as u32,
+                            is_struct: false,
+                            current_length,
+                            total_processed: 0,
+                        }
+                    );
+                }
+                Nested::LargeList(nested) => {
+                    current_level += nested.is_optional as u32;
+                    validity_bonus += 1;
+                    let mut length_iter = to_length(&nested.offsets);
+                    let current_length = length_iter.next().unwrap_or(0);
+                    stack.push(
+                        StackState {
+                            current_level,
+                            validity_bonus,
+                            lengths: Box::new(length_iter),
+                            validity: None,
+                            is_primitive: false,
+                            is_optional: nested.is_optional as u32,
+                            is_struct: false,
+                            current_length,
+                            total_processed: 0,
+                        }
+                    );
+                }
+                // Struct fields are ignored for rep level calculations
+                Nested::Struct(_, _, _) => (),
+                Nested::FixedSizeList {is_optional, width, len, ..} => {
+                    current_level += *is_optional as u32;
+                    validity_bonus += 1;
+                    let mut length_iter = std::iter::repeat(*width).take(*len);
+                    let current_length = length_iter.next().unwrap_or(0);
+                    stack.push(
+                        StackState {
+                            current_level,
+                            validity_bonus,
+                            lengths: Box::new(length_iter),
+                            validity: None,
+                            is_primitive: false,
+                            is_optional: *is_optional as u32,
+                            is_struct: false,
+                            current_length,
+                            total_processed: 0,
+                        }
+                    );
+                }
+            };
+        }
 
         Self {
-            iter,
-            remaining,
-            total: 0,
-            current_level: 0,
+            stack,
+            stack_idx: 0,
             remaining_values,
         }
     }
@@ -90,48 +197,39 @@ impl<'a> Iterator for RepLevelsIter<'a> {
         if self.remaining_values == 0 {
             return None;
         }
-        if self.remaining.is_empty() {
-            self.remaining_values -= 1;
-            return Some(0);
+        let mut stack_state = &mut self.stack[self.stack_idx];
+        // Unwind stack until reaching an unfinished group
+        while stack_state.current_length == 0 && self.stack_idx > 0 {
+            // Start next group if current is complete
+            stack_state.current_length = stack_state.lengths.next().unwrap_or(0);
+            stack_state.total_processed = 0;
+            self.stack_idx -= 1;
+            stack_state = &mut self.stack[self.stack_idx];
         }
-
-        for (iter, remaining) in self
-            .iter
-            .iter_mut()
-            .zip(self.remaining.iter_mut())
-            .skip(self.current_level)
-        {
-            let length: usize = iter.next()?;
-            *remaining = length;
-            if length == 0 {
-                break;
+        let outer_level = stack_state.current_level;
+        loop {
+            // Advance current group and move deeper into stack
+            stack_state.current_length -= 1;
+            stack_state.total_processed += 1;
+            self.stack_idx += 1;
+            stack_state = &mut self.stack[self.stack_idx];
+            // Repetition level for null is always outer level
+            if stack_state.current_length == 0 {
+                self.remaining_values -= 1;
+                return Some(outer_level);
             }
-            self.current_level += 1;
-            self.total += 1;
-        }
-
-        // track
-        if let Some(x) = self.remaining.get_mut(self.current_level.saturating_sub(1)) {
-            *x = x.saturating_sub(1)
-        }
-        let r = Some((self.current_level - self.total) as u32);
-
-        // update
-        unsafe {
-            for index in (1..self.current_level).rev() {
-                if *self.remaining.get_unchecked_release(index) == 0 {
-                    self.current_level -= 1;
-                    *self.remaining.get_unchecked_release_mut(index - 1) -= 1;
+            if stack_state.is_primitive {
+                // Get level information from nested that contains primitive
+                self.stack_idx -= 1;
+                self.remaining_values -= 1;
+                stack_state = &mut self.stack[self.stack_idx];
+                // First repetition level is outer level
+                if stack_state.total_processed == 1 {
+                    return Some(outer_level);
                 }
-            }
-            if *self.remaining.get_unchecked_release(0) == 0 {
-                self.current_level = self.current_level.saturating_sub(1);
+                return Some(stack_state.current_level);
             }
         }
-        self.total = 0;
-        self.remaining_values -= 1;
-
-        r
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -178,7 +276,7 @@ mod tests {
     fn l1() {
         let nested = vec![
             Nested::List(ListNested {
-                is_optional: false,
+                is_optional: true,
                 offsets: vec![0, 2, 2, 5, 8, 8, 11, 11, 12].try_into().unwrap(),
                 validity: None,
             }),
@@ -193,12 +291,12 @@ mod tests {
     fn l2() {
         let nested = vec![
             Nested::List(ListNested {
-                is_optional: false,
+                is_optional: true,
                 offsets: vec![0, 2, 2, 4].try_into().unwrap(),
                 validity: None,
             }),
             Nested::List(ListNested {
-                is_optional: false,
+                is_optional: true,
                 offsets: vec![0, 3, 7, 8, 10].try_into().unwrap(),
                 validity: None,
             }),
@@ -274,12 +372,12 @@ mod tests {
     fn l2_other() {
         let nested = vec![
             Nested::List(ListNested {
-                is_optional: false,
+                is_optional: true,
                 offsets: vec![0, 1, 1, 3, 5, 5, 8, 8, 9].try_into().unwrap(),
                 validity: None,
             }),
             Nested::List(ListNested {
-                is_optional: false,
+                is_optional: true,
                 offsets: vec![0, 2, 4, 5, 7, 8, 9, 10, 11, 12].try_into().unwrap(),
                 validity: None,
             }),
