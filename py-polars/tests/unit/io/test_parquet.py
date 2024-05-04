@@ -935,3 +935,36 @@ def test_hybrid_rle() -> None:
         assert "RLE_DICTIONARY" in column["encodings"]
     f.seek(0)
     assert_frame_equal(pl.read_parquet(f), df)
+
+
+@pytest.mark.slow()
+def test_hybrid_rle_nested() -> None:
+    df = pl.DataFrame(
+        {
+            # Test mix of bit-packed and RLE runs
+            "bit_pack_and_rle": [
+                [0] + [1] * 19 + [2] * 8 + [3] * 12 + [4] * 5 + [5] * 5
+            ]
+            * 1000,
+            # Test some null values
+            "nullable_list": [
+                [None] + [1] * 19 + [None] * 8 + [3] * 12 + [4] * 5 + [None] * 5
+            ]
+            * 1000,
+            "complex_nesting": [
+                [
+                    {"a": [1, 2, 3], "b": [3, None, None]},
+                    {"b": None, "c": [[1, None], None, [None]]},
+                    {"d": [{"d_1": 1, "d_2": [1, None]}, {"d_2": None}]},
+                ]
+            ]
+            * 1000,
+        }
+    )
+    f = io.BytesIO()
+    df.write_parquet(f)
+    f.seek(0)
+    for column in pq.ParquetFile(f).metadata.to_dict()["row_groups"][0]["columns"]:
+        assert "RLE_DICTIONARY" in column["encodings"]
+    f.seek(0)
+    assert_frame_equal(pl.read_parquet(f), df)

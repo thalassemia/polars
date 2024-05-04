@@ -16,15 +16,15 @@ mod pack8 {
         let input_ptr = input_arr.as_ptr();
         let mut output_ptr = output_arr.as_mut_ptr();
         let mut out_register: u8 = load_unaligned(input_ptr);
-        
+
         unroll! {
             for iter in 0..6 {
                 let i: usize = 1 + iter;
-        
+
                 let bits_filled: usize = i * NUM_BITS;
                 let inner_cursor: usize = bits_filled % 8;
                 let remaining: usize = 8 - inner_cursor;
-        
+
                 let offset_ptr = input_ptr.add(i);
                 let in_register: u8 = load_unaligned(offset_ptr);
 
@@ -34,7 +34,7 @@ mod pack8 {
                     } else {
                         in_register
                     };
-        
+
                 if remaining <= NUM_BITS {
                     store_unaligned(output_ptr, out_register);
                     output_ptr = output_ptr.offset(1);
@@ -85,15 +85,15 @@ mod pack16 {
         let input_ptr = input_arr.as_ptr();
         let mut output_ptr = output_arr.as_mut_ptr() as *mut u16;
         let mut out_register: u16 = load_unaligned(input_ptr);
-        
+
         unroll! {
             for iter in 0..14 {
                 let i: usize = 1 + iter;
-        
+
                 let bits_filled: usize = i * NUM_BITS;
                 let inner_cursor: usize = bits_filled % 16;
                 let remaining: usize = 16 - inner_cursor;
-        
+
                 let offset_ptr = input_ptr.add(i);
                 let in_register: u16 = load_unaligned(offset_ptr);
 
@@ -103,7 +103,7 @@ mod pack16 {
                     } else {
                         in_register
                     };
-        
+
                 if remaining <= NUM_BITS {
                     store_unaligned(output_ptr, out_register);
                     output_ptr = output_ptr.offset(1);
@@ -141,7 +141,7 @@ mod pack32 {
     use std::ptr::{read_unaligned as load_unaligned, write_unaligned as store_unaligned};
 
     use crunchy::unroll;
-    pub unsafe fn pack<const NUM_BITS: usize>(input_arr: &[u32; 32], output_arr: &mut [u8]) { 
+    pub unsafe fn pack<const NUM_BITS: usize>(input_arr: &[u32; 32], output_arr: &mut [u8]) {
         if NUM_BITS == 0 {
             for out in output_arr {
                 *out = 0;
@@ -154,15 +154,15 @@ mod pack32 {
         let input_ptr = input_arr.as_ptr();
         let mut output_ptr = output_arr.as_mut_ptr() as *mut u32;
         let mut out_register: u32 = load_unaligned(input_ptr);
-        
+
         unroll! {
             for iter in 0..30 {
                 let i: usize = 1 + iter;
-        
+
                 let bits_filled: usize = i * NUM_BITS;
                 let inner_cursor: usize = bits_filled % 32;
                 let remaining: usize = 32 - inner_cursor;
-        
+
                 let offset_ptr = input_ptr.add(i);
                 let in_register: u32 = load_unaligned(offset_ptr);
 
@@ -172,7 +172,7 @@ mod pack32 {
                     } else {
                         in_register
                     };
-        
+
                 if remaining <= NUM_BITS {
                     store_unaligned(output_ptr, out_register);
                     output_ptr = output_ptr.offset(1);
@@ -210,7 +210,7 @@ mod pack64 {
     use std::ptr::{read_unaligned as load_unaligned, write_unaligned as store_unaligned};
 
     use crunchy::unroll;
-    pub unsafe fn pack<const NUM_BITS: usize>(input_arr: &[u64; 64], output_arr: &mut [u8]) {    
+    pub unsafe fn pack<const NUM_BITS: usize>(input_arr: &[u64; 64], output_arr: &mut [u8]) {
         if NUM_BITS == 0 {
             for out in output_arr {
                 *out = 0;
@@ -223,15 +223,15 @@ mod pack64 {
         let input_ptr = input_arr.as_ptr();
         let mut output_ptr = output_arr.as_mut_ptr() as *mut u64;
         let mut out_register: u64 = load_unaligned(input_ptr);
-        
+
         unroll! {
             for iter in 0..62 {
                 let i: usize = 1 + iter;
-        
+
                 let bits_filled: usize = i * NUM_BITS;
                 let inner_cursor: usize = bits_filled % 64;
                 let remaining: usize = 64 - inner_cursor;
-        
+
                 let offset_ptr = input_ptr.add(i);
                 let in_register: u64 = load_unaligned(offset_ptr);
 
@@ -241,7 +241,7 @@ mod pack64 {
                     } else {
                         in_register
                     };
-        
+
                 if remaining <= NUM_BITS {
                     store_unaligned(output_ptr, out_register);
                     output_ptr = output_ptr.offset(1);
