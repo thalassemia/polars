@@ -1,5 +1,3 @@
-use polars_utils::slice::GetSaferUnchecked;
-
 use super::super::pages::Nested;
 use super::to_length;
 
