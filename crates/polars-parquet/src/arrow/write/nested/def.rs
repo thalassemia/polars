@@ -1,6 +1,27 @@
+use arrow::bitmap::utils::BitmapIter;
+
 use super::super::pages::Nested;
-use super::rep::{StackState, num_values};
+use super::rep::{DebugIter, num_values};
 use super::to_length;
+
+/// Store information about recursive stack
+#[derive(Debug)]
+pub struct StackState<'a> {
+    // current repetition level
+    pub current_level: u32,
+    // iterator over lengths of inner values
+    pub lengths: Box<dyn DebugIter + 'a>,
+    pub is_struct: bool,
+    // validity iterator (only for leaf primitive arrays)
+    pub primitive_validity: Option<BitmapIter<'a>>,
+    pub validity: Option<BitmapIter<'a>>,
+    pub is_optional: u32,
+    pub is_primitive: bool,
+    // calculate def level differently for structs
+    pub null_level: u32,
+    // remaining length of current inner value
+    pub current_length: usize
+}
 
 /// Iterator adapter of parquet / dremel definition levels
 #[derive(Debug)]
@@ -20,46 +41,39 @@ impl<'a> DefLevelsIter<'a> {
         // Add root node to stack
         let mut stack = vec![];
         let mut current_level = 0;
-        let mut validity_bonus = 0;
+        let mut null_level = 0;
         stack.push(
             StackState {
                 current_level,
-                validity_bonus,
                 lengths: Box::new(std::iter::empty()),
                 validity: None,
-                is_primitive: false,
+                primitive_validity: None,
                 is_optional: 0,
                 is_struct: false,
+                is_primitive: false,
+                null_level,
                 current_length: nested[0].len(),
-                total_processed: 0
             }
         );
         for curr_nested in nested {
             match curr_nested {
-                Nested::Primitive(validity, is_optional, len) => {
+                Nested::Primitive(validity, is_optional, _) => {
                     let validity_iter;
                     if let Some(validity) = validity {
                         validity_iter = Some(validity.iter());
                     } else {
                         validity_iter = None;
                     }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            validity_bonus,
-                            lengths: Box::new(std::iter::empty()),
-                            validity: validity_iter,
-                            is_primitive: true,
-                            is_optional: *is_optional as u32,
-                            is_struct: false,
-                            current_length: *len,
-                            total_processed: 0,
-                        }
-                    );
+                    if let Some(last_stack_item) = stack.last_mut() {
+                        last_stack_item.primitive_validity = validity_iter;
+                        last_stack_item.is_optional = *is_optional as u32;
+                        last_stack_item.is_primitive = true;
+                    } else {
+                        unreachable!();
+                    }
                 }
                 Nested::List(nested) => {
-                    current_level += nested.is_optional as u32;
-                    validity_bonus += 1;
+                    current_level += nested.is_optional as u32 + 1;
                     let mut length_iter = to_length(&nested.offsets);
                     let current_length = length_iter.next().unwrap_or(0);
                     let validity_iter;
@@ -71,20 +85,20 @@ impl<'a> DefLevelsIter<'a> {
                     stack.push(
                         StackState {
                             current_level,
-                            validity_bonus,
                             lengths: Box::new(length_iter),
-                            validity: validity_iter,
                             is_primitive: false,
-                            is_optional: nested.is_optional as u32,
+                            validity: validity_iter,
+                            primitive_validity: None,
+                            is_optional: 0,
                             is_struct: false,
+                            null_level,
                             current_length,
-                            total_processed: 0,
                         }
                     );
+                    null_level = current_level;
                 }
                 Nested::LargeList(nested) => {
-                    current_level += nested.is_optional as u32;
-                    validity_bonus += 1;
+                    current_level += nested.is_optional as u32 + 1;
                     let mut length_iter = to_length(&nested.offsets);
                     let current_length = length_iter.next().unwrap_or(0);
                     let validity_iter;
@@ -96,19 +110,20 @@ impl<'a> DefLevelsIter<'a> {
                     stack.push(
                         StackState {
                             current_level,
-                            validity_bonus,
                             lengths: Box::new(length_iter),
-                            validity: validity_iter,
                             is_primitive: false,
-                            is_optional: nested.is_optional as u32,
+                            validity: validity_iter,
+                            primitive_validity: None,
+                            is_optional: 0,
                             is_struct: false,
+                            null_level,
                             current_length,
-                            total_processed: 0,
                         }
                     );
+                    null_level = current_level;
                 }
                 Nested::Struct(validity, is_optional, len) => {
-                    validity_bonus += *is_optional as u32;
+                    current_level += *is_optional as u32;
                     let mut length_iter = std::iter::repeat(1).take(*len);
                     let current_length = length_iter.next().unwrap_or(0);
                     let validity_iter;
@@ -120,35 +135,36 @@ impl<'a> DefLevelsIter<'a> {
                     stack.push(
                         StackState {
                             current_level,
-                            validity_bonus,
                             lengths: Box::new(length_iter),
-                            validity: validity_iter,
                             is_primitive: false,
-                            is_optional: *is_optional as u32,
+                            validity: validity_iter,
+                            primitive_validity: None,
+                            is_optional: 0,
                             is_struct: true,
+                            null_level: null_level,
                             current_length,
-                            total_processed: 0,
                         }
                     );
-                },
+                    null_level = current_level;
+                }
                 Nested::FixedSizeList {is_optional, width, len, ..} => {
-                    current_level += *is_optional as u32;
-                    validity_bonus += 1;
+                    current_level += *is_optional as u32 + 1;
                     let mut length_iter = std::iter::repeat(*width).take(*len);
                     let current_length = length_iter.next().unwrap_or(0);
                     stack.push(
                         StackState {
                             current_level,
-                            validity_bonus,
                             lengths: Box::new(length_iter),
-                            validity: None,
                             is_primitive: false,
-                            is_optional: *is_optional as u32,
+                            validity: None,
+                            primitive_validity: None,
+                            is_optional: 0,
                             is_struct: false,
+                            null_level,
                             current_length,
-                            total_processed: 0,
                         }
                     );
+                    null_level = current_level;
                 }
             };
         }
@@ -176,43 +192,35 @@ impl<'a> Iterator for DefLevelsIter<'a> {
             self.stack_idx -= 1;
             stack_state = &mut self.stack[self.stack_idx];
         }
-        let mut prev_not_valid = false;
+        let mut struct_adjustment = 0;
         loop {
-            // Advance current group and move deeper into stack
             stack_state.current_length -= 1;
-            let struct_not_valid = stack_state.is_struct && prev_not_valid;
+            if stack_state.is_primitive {
+                self.remaining_values -= 1;
+                let is_valid;
+                if let Some(validity) = &mut stack_state.primitive_validity {
+                    is_valid = validity.next().unwrap() as u32;
+                } else {
+                    is_valid = stack_state.is_optional;
+                }
+                return Some(stack_state.current_level + is_valid - struct_adjustment);
+            }
+            // Advance current group and move deeper into stack
             self.stack_idx += 1;
             stack_state = &mut self.stack[self.stack_idx];
-            let is_valid ;
+            let is_valid;
             if let Some(validity) = &mut stack_state.validity {
                 is_valid = validity.next().unwrap() as u32;
+                if stack_state.is_struct {
+                    struct_adjustment += (is_valid == 0) as u32;
+                }
             } else {
                 is_valid = stack_state.is_optional;
             }
             if stack_state.current_length == 0 {
                 self.remaining_values -= 1;
-                // Go back two levels if previous level was struct whose
-                // current value is null. This is because the arrays that
-                // back the struct do not distinguish between null values
-                // and null fields. Example: [{'a': None}, None, {'a': 1}]
-                // is backed by [None, None, 1].
-                if struct_not_valid {
-                    stack_state = &mut self.stack[self.stack_idx - 2];
-                } else {
-                    stack_state = &mut self.stack[self.stack_idx - 1];
-                }
-                return Some(stack_state.current_level + stack_state.validity_bonus + is_valid);
+                return Some(stack_state.null_level + is_valid - struct_adjustment);
             }
-            if stack_state.is_primitive {
-                self.stack_idx -= 1;
-                self.remaining_values -= 1;
-                // Go back two levels for same reason as above
-                if struct_not_valid {
-                    stack_state = &mut self.stack[self.stack_idx - 1];
-                }
-                return Some(stack_state.current_level + stack_state.validity_bonus + is_valid);
-            }
-            prev_not_valid = is_valid == 0;
         }
     }
 
