@@ -1,5 +1,3 @@
-use arrow::bitmap::utils::BitmapIter;
-
 use super::super::pages::Nested;
 use super::to_length;
 
