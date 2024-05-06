@@ -216,13 +216,10 @@ pub fn array_to_pages(
         });
     };
     if let Encoding::RleDictionary = encoding {
-        // Only take this path for primitive columns
-        if matches!(nested.first(), Some(Nested::Primitive(_, _, _))) {
-            if let Some(result) =
-                encode_as_dictionary_optional(primitive_array, nested, type_.clone(), options)
-            {
-                return result;
-            }
+        if let Some(result) =
+            encode_as_dictionary_optional(primitive_array, nested, type_.clone(), options)
+        {
+            return result;
         }
 
         // We didn't succeed, fallback to plain
