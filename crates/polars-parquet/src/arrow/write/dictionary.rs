@@ -14,7 +14,7 @@ use super::primitive::{
 };
 use super::{binview, nested, Nested, WriteOptions};
 use crate::arrow::read::schema::is_nullable;
-use crate::arrow::write::{slice_nested_leaf, utils};
+use crate::arrow::write::{slice_parquet_array, utils};
 use crate::parquet::encoding::hybrid_rle::encode;
 use crate::parquet::encoding::Encoding;
 use crate::parquet::page::{DictPage, Page};
@@ -29,11 +29,16 @@ pub(crate) fn encode_as_dictionary_optional(
     options: WriteOptions,
 ) -> Option<PolarsResult<DynIter<'static, PolarsResult<Page>>>> {
     let dtype = Box::new(array.data_type().clone());
+    // Nested arrays must be recursively sliced to match row group size
+    let number_of_rows = nested[0].len();
+    let mut array = array.to_boxed().clone();
+    let mut nested = nested.to_vec().clone();
+    slice_parquet_array(array.as_mut(), &mut nested, 0, number_of_rows);
 
     let len_before = array.len();
     // This does the group by.
     let array = arrow::compute::cast::cast(
-        array,
+        array.as_ref(),
         &ArrowDataType::Dictionary(IntegerType::UInt32, dtype, false),
         Default::default(),
     )
@@ -51,7 +56,7 @@ pub(crate) fn encode_as_dictionary_optional(
     Some(array_to_pages(
         array,
         type_,
-        nested,
+        &nested,
         options,
         Encoding::RleDictionary,
     ))
@@ -137,36 +142,26 @@ fn serialize_keys<K: DictionaryKey>(
     options: WriteOptions,
 ) -> PolarsResult<Page> {
     let mut buffer = vec![];
-
-    let (start, len) = slice_nested_leaf(nested);
-
-    let mut nested = nested.to_vec();
-    let array = array.clone().sliced(start, len);
-    if let Some(Nested::Primitive(_, _, c)) = nested.last_mut() {
-        *c = len;
-    } else {
-        unreachable!("")
-    }
     // Parquet only accepts a single validity - we "&" the validities into a single one
     // and ignore keys whose _value_ is null.
     // It's important that we slice before normalizing.
-    let validity = normalized_validity(&array);
+    let validity = normalized_validity(array);
 
     let (repetition_levels_byte_length, definition_levels_byte_length) = serialize_levels(
         validity.as_ref(),
         array.len(),
         &type_,
-        &nested,
+        nested,
         options,
         &mut buffer,
     )?;
 
-    serialize_keys_values(&array, validity.as_ref(), &mut buffer)?;
+    serialize_keys_values(array, validity.as_ref(), &mut buffer)?;
 
     let (num_values, num_rows) = if nested.len() == 1 {
         (array.len(), array.len())
     } else {
-        (nested::num_values(&nested), nested[0].len())
+        (nested::num_values(nested), nested[0].len())
     };
 
     utils::build_plain_page(
