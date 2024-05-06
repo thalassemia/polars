@@ -157,7 +157,11 @@ impl<'a> Iterator for RepLevelsIter<'a> {
         }
         let mut stack_state = &mut self.stack[self.stack_idx];
         // Unwind stack until reaching an unfinished group
-        while stack_state.current_length == 0 && self.stack_idx > 0 {
+        while stack_state.current_length == 0 {
+            if self.stack_idx == 0 {
+                self.remaining_values -= 1;
+                return Some(0);
+            }
             // Start next group if current is complete
             stack_state.current_length = stack_state.lengths.next().unwrap_or(0);
             stack_state.total_processed = 0;
