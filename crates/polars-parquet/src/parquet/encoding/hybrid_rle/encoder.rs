@@ -71,9 +71,10 @@ impl Encoder<u32> for u32 {
                 .take(remainder)
                 .zip(buffer.iter_mut())
                 .for_each(|(item, buf)| *buf = item);
-
+            // No need to zero rest of buffer: this branch only encodes final
+            // values and data beyond column length is ignored by decoders
             let mut packed = [0u8; 4 * U32_BLOCK_LEN];
-            bitpacked::encode_pack(&buffer[..remainder], num_bits, packed.as_mut());
+            bitpacked::encode_pack(&buffer, num_bits, packed.as_mut());
             writer.write_all(&packed[..compressed_remainder_size])?;
         };
         Ok(())

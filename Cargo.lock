@@ -3007,6 +3007,7 @@ dependencies = [
  "async-stream",
  "base64 0.22.0",
  "brotli",
+ "crunchy",
  "ethnum",
  "fallible-streaming-iterator",
  "flate2",
