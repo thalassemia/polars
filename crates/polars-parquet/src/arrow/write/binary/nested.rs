@@ -14,15 +14,13 @@ pub fn array_to_page<O>(
     options: WriteOptions,
     type_: PrimitiveType,
     nested: &[Nested],
-    def_levels: &Vec<u32>,
-    rep_levels: &Vec<u32>
 ) -> PolarsResult<DataPage>
 where
     O: Offset,
 {
     let mut buffer = vec![];
     let (repetition_levels_byte_length, definition_levels_byte_length) =
-        nested::write_rep_and_def(options.version, nested, &mut buffer, def_levels, rep_levels)?;
+        nested::write_rep_and_def(options.version, nested, &mut buffer)?;
 
     encode_plain(array, &mut buffer);
 

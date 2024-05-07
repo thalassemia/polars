@@ -29,14 +29,14 @@ fn write_levels_v1<F: FnOnce(&mut Vec<u8>) -> PolarsResult<()>>(
 }
 
 /// writes the rep levels to a `Vec<u8>`.
-fn write_rep_levels(buffer: &mut Vec<u8>, nested: &[Nested], levels: &Vec<u32>, version: Version) -> PolarsResult<()> {
+fn write_rep_levels(buffer: &mut Vec<u8>, nested: &[Nested], version: Version) -> PolarsResult<()> {
     let max_level = max_rep_level(nested) as i16;
     if max_level == 0 {
         return Ok(());
     }
     let num_bits = get_bit_width(max_level);
 
-    // let levels = rep::RepLevelsIter::new(nested);
+    let levels = rep::calculate_rep_levels(nested)?;
     match version {
         Version::V1 => {
             write_levels_v1(buffer, |buffer: &mut Vec<u8>| {
@@ -53,14 +53,14 @@ fn write_rep_levels(buffer: &mut Vec<u8>, nested: &[Nested], levels: &Vec<u32>, 
 }
 
 /// writes the rep levels to a `Vec<u8>`.
-fn write_def_levels(buffer: &mut Vec<u8>, nested: &[Nested], levels: &Vec<u32>, version: Version) -> PolarsResult<()> {
+fn write_def_levels(buffer: &mut Vec<u8>, nested: &[Nested], version: Version) -> PolarsResult<()> {
     let max_level = max_def_level(nested) as i16;
     if max_level == 0 {
         return Ok(());
     }
     let num_bits = get_bit_width(max_level);
 
-    // let levels = def::DefLevelsIter::new(nested);
+    let levels = def::calculate_def_levels(nested)?;
     match version {
         Version::V1 => write_levels_v1(buffer, move |buffer: &mut Vec<u8>| {
             encode::<u32, _, _>(buffer, levels.iter().cloned(), num_bits)?;
@@ -106,13 +106,11 @@ pub fn write_rep_and_def(
     page_version: Version,
     nested: &[Nested],
     buffer: &mut Vec<u8>,
-    def_levels: &Vec<u32>,
-    rep_levels: &Vec<u32>
 ) -> PolarsResult<(usize, usize)> {
-    write_rep_levels(buffer, nested, rep_levels, page_version)?;
+    write_rep_levels(buffer, nested, page_version)?;
     let repetition_levels_byte_length = buffer.len();
 
-    write_def_levels(buffer, nested, def_levels, page_version)?;
+    write_def_levels(buffer, nested, page_version)?;
     let definition_levels_byte_length = buffer.len() - repetition_levels_byte_length;
 
     Ok((repetition_levels_byte_length, definition_levels_byte_length))

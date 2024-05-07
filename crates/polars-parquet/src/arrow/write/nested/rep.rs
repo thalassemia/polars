@@ -1,5 +1,187 @@
 use super::super::pages::Nested;
 use super::to_length;
+use polars_error::{PolarsResult, polars_bail};
+
+/// Constructs iterators for rep levels of `array`
+pub fn calculate_rep_levels(nested: &[Nested]
+) -> PolarsResult<Vec<u32>> {
+    if nested.len() == 0 {
+        return Ok(vec![]);
+    }
+    let value_count = num_values(nested);
+    let mut rep_levels = Vec::with_capacity(value_count);
+
+    rep_levels_recursive(nested, &mut rep_levels, 0, 0, 0, nested[0].len())?;
+    Ok(rep_levels)
+}
+
+fn rep_levels_recursive(
+    nested: &[Nested],
+    rep_levels: &mut Vec<u32>,
+    current_level: u32,
+    parent_level: u32,
+    offset: usize,
+    length: usize,
+) -> PolarsResult<()> {
+    if length == 0 {
+        rep_levels.push(parent_level);
+        return Ok(());
+    }
+    let current_nested = &nested[0];
+    match current_nested {
+        Nested::Primitive(..) => {
+            rep_levels.push(parent_level);
+            rep_levels.extend(
+                std::iter::repeat(current_level).take(length - 1)
+            );
+        }
+        Nested::List(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            sliced_offsets.slice(offset, length + 1);
+            let next_level = current_level + list_nested.is_optional as u32;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                let mut bitmap_iter = sliced_bitmap.iter();
+                // First element inherits parent level
+                match bitmap_iter.next() {
+                    Some(true) => {
+                        let (start, end) = sliced_offsets.start_end(0);
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, start, end - start)?;
+                    }
+                    Some(false) => {
+                        rep_levels.push(parent_level);
+                    }
+                    None => {
+                        polars_bail!(InvalidOperation:
+                            "Validity bitmap should not be empty".to_string(),
+                        )
+                    }
+                }
+                // Subsequent elements take current level as parent level
+                for (i, is_valid) in bitmap_iter.enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i + 1);
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, start, end - start)?;
+                    } else {
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                let (start, end) = sliced_offsets.start_end(0);
+                rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, start, end - start)?;
+                for i in 1..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, start, end - start)?;
+                }
+            }
+        }
+        Nested::LargeList(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            sliced_offsets.slice(offset, length + 1);
+            let next_level = current_level + list_nested.is_optional as u32;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                let mut bitmap_iter = sliced_bitmap.iter();
+                // First element inherits parent level
+                match bitmap_iter.next() {
+                    Some(true) => {
+                        let (start, end) = sliced_offsets.start_end(0);
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, start, end - start)?;
+                    }
+                    Some(false) => {
+                        rep_levels.push(parent_level);
+                    }
+                    None => {
+                        polars_bail!(InvalidOperation:
+                            "Validity bitmap should not be empty".to_string(),
+                        )
+                    }
+                }
+                // Subsequent elements take current level as parent level
+                for (i, is_valid) in bitmap_iter.enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i + 1);
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, start, end - start)?;
+                    } else {
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                let (start, end) = sliced_offsets.start_end(0);
+                rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, start, end - start)?;
+                for i in 1..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, start, end - start)?;
+                }
+            }
+        }
+        Nested::Struct(validity, ..) => {
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                let mut bitmap_iter = sliced_bitmap.iter();
+                // First element inherits parent level
+                if let Some(true) = bitmap_iter.next() {
+                    rep_levels_recursive(&nested[1..], rep_levels, current_level, parent_level, offset, 1)?;
+                } else {
+                    rep_levels.push(parent_level);
+                }
+                // Subsequent elements take current level as parent level
+                for (i, is_valid) in bitmap_iter.enumerate() {
+                    if is_valid {
+                        rep_levels_recursive(&nested[1..], rep_levels, current_level, current_level, offset + i + 1, 1)?;
+                    } else {
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                rep_levels_recursive(&nested[1..], rep_levels, current_level, parent_level, offset, 1)?;
+                if length > 1 {
+                    rep_levels_recursive(&nested[1..], rep_levels, current_level, current_level, offset + 1, length - 1)?;
+                }
+            }
+        }
+        Nested::FixedSizeList {is_optional, width, validity, ..} => {
+            let next_level = current_level + *is_optional as u32;
+            // Fields are nullable if array has bitmap
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                let mut bitmap_iter = sliced_bitmap.iter();
+                // First element has repetition level = parent level
+                match bitmap_iter.next() {
+                    Some(true) => {
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, 0, *width)?;
+                    }
+                    Some(false) => {
+                        rep_levels.push(parent_level);
+                    }
+                    None => {
+                        polars_bail!(InvalidOperation:
+                            "Validity bitmap should not be empty".to_string(),
+                        )
+                    }
+                }
+                // Subsequent elements have repetition level = current level
+                for (i, is_valid) in bitmap_iter.enumerate() {
+                    if is_valid {
+                        rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, width * (i+1), *width)?;
+                    } else {
+                        rep_levels.push(current_level);
+                    }
+                }
+            } else {
+                rep_levels_recursive(&nested[1..], rep_levels, next_level, parent_level, 0, *width)?;
+                for i in 1..length {
+                    rep_levels_recursive(&nested[1..], rep_levels, next_level, current_level, width * i, *width)?;
+                }
+            }
+        }
+    };
+    Ok(())
+}
 
 pub trait DebugIter: Iterator<Item = usize> + std::fmt::Debug {}
 
@@ -42,170 +224,18 @@ pub fn num_values(nested: &[Nested]) -> usize {
         + pr
 }
 
-/// Store information about recursive stack
-#[derive(Debug)]
-pub struct StackState<'a> {
-    // current repetition level
-    pub current_level: u32,
-    // iterator over lengths of inner values
-    pub lengths: Box<dyn DebugIter + 'a>,
-    // whether next level is primitive array
-    pub is_primitive: bool,
-    // remaining length of current inner value
-    pub current_length: usize,
-    // total inner values processed
-    pub total_processed: usize,
-}
-
-/// Iterator adapter of parquet / dremel repetition levels
-#[derive(Debug)]
-pub struct RepLevelsIter<'a> {
-    // current stack for recursion
-    stack: Vec<StackState<'a>>,
-    // current location on stack
-    stack_idx: usize,
-    // the total number of items that this iterator will return
-    remaining_values: usize,
-}
-
-impl<'a> RepLevelsIter<'a> {
-    pub fn new(nested: &'a [Nested]) -> Self {
-        let remaining_values = num_values(nested);
-
-        // Add root node to stack
-        let mut stack = vec![];
-        let mut current_level = 0;
-        stack.push(
-            StackState {
-                current_level,
-                lengths: Box::new(std::iter::empty()),
-                is_primitive: false,
-                current_length: nested[0].len(),
-                total_processed: 0
-            }
-        );
-        for curr_nested in nested {
-            match curr_nested {
-                Nested::Primitive(_, _, _) => {
-                    if let Some(last_stack_item) = stack.last_mut() {
-                        last_stack_item.is_primitive = true;
-                    } else {
-                        unreachable!();
-                    }
-                }
-                Nested::List(nested) => {
-                    current_level += nested.is_optional as u32;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            total_processed: 0,
-                        }
-                    );
-                }
-                Nested::LargeList(nested) => {
-                    current_level += nested.is_optional as u32;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            total_processed: 0,
-                        }
-                    );
-                }
-                // Struct fields are ignored for rep level calculations
-                Nested::Struct(_, _, _) => (),
-                Nested::FixedSizeList {is_optional, width, len, ..} => {
-                    current_level += *is_optional as u32;
-                    let mut length_iter = std::iter::repeat(*width).take(*len);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            total_processed: 0,
-                        }
-                    );
-                }
-            };
-        }
-
-        Self {
-            stack,
-            stack_idx: 0,
-            remaining_values,
-        }
-    }
-}
-
-impl<'a> Iterator for RepLevelsIter<'a> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_values == 0 {
-            return None;
-        }
-        let mut stack_state = &mut self.stack[self.stack_idx];
-        // Unwind stack until reaching an unfinished group
-        while stack_state.current_length == 0 {
-            if self.stack_idx == 0 {
-                self.remaining_values -= 1;
-                return Some(0);
-            }
-            // Start next group if current is complete
-            stack_state.current_length = stack_state.lengths.next().unwrap_or(0);
-            stack_state.total_processed = 0;
-            self.stack_idx -= 1;
-            stack_state = &mut self.stack[self.stack_idx];
-        }
-        let outer_level = stack_state.current_level;
-        loop {
-            stack_state.current_length -= 1;
-            stack_state.total_processed += 1;
-            if stack_state.is_primitive {
-                self.remaining_values -= 1;
-                // First repetition level is outer level
-                if stack_state.total_processed == 1 {
-                    return Some(outer_level);
-                }
-                return Some(stack_state.current_level);
-            }
-            self.stack_idx += 1;
-            stack_state = &mut self.stack[self.stack_idx];
-            // Repetition level for null is always outer level
-            if stack_state.current_length == 0 {
-                self.remaining_values -= 1;
-                return Some(outer_level);
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let length = self.remaining_values;
-        (length, Some(length))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::super::pages::ListNested;
     use super::*;
 
     fn test(nested: Vec<Nested>, expected: Vec<u32>) {
-        let mut iter = RepLevelsIter::new(&nested);
-        assert_eq!(iter.size_hint().0, expected.len());
-        assert_eq!(iter.by_ref().collect::<Vec<_>>(), expected);
-        assert_eq!(iter.size_hint().0, 0);
+        if let Ok(result) = calculate_rep_levels(&nested) {
+            assert_eq!(result.len(), expected.len());
+            assert_eq!(result, expected);
+        } else {
+            panic!("Failed to calculate rep levels.")
+        }
     }
 
     #[test]
@@ -370,12 +400,12 @@ mod tests {
             Nested::Struct(None, true, 12),
             Nested::List(ListNested {
                 is_optional: true,
-                offsets: vec![0, 1, 2, 3, 3, 4, 4, 4, 4, 5, 6, 8].try_into().unwrap(),
+                offsets: vec![0, 1, 2, 3, 3, 4, 4, 4, 4, 5, 6, 8, 8].try_into().unwrap(),
                 validity: None,
             }),
             Nested::Primitive(None, true, 8),
         ];
-        let expected = vec![0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 2, 0];
+        let expected = vec![0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 2, 0, 0];
 
         test(nested, expected)
     }

@@ -1,237 +1,155 @@
-use arrow::bitmap::utils::BitmapIter;
+use polars_error::PolarsResult;
 
 use super::super::pages::Nested;
-use super::rep::{DebugIter, num_values};
-use super::to_length;
+use super::rep::num_values;
 
-/// Store information about recursive stack
-#[derive(Debug)]
-pub struct StackState<'a> {
-    // current repetition level
-    pub current_level: u32,
-    // iterator over lengths of inner values
-    pub lengths: Box<dyn DebugIter + 'a>,
-    pub is_struct: bool,
-    // validity iterator (only for leaf primitive arrays)
-    pub primitive_validity: Option<BitmapIter<'a>>,
-    pub validity: Option<BitmapIter<'a>>,
-    pub is_optional: u32,
-    pub is_primitive: bool,
-    // calculate def level differently for structs
-    pub null_level: u32,
-    // remaining length of current inner value
-    pub current_length: usize
-}
-
-/// Iterator adapter of parquet / dremel definition levels
-#[derive(Debug)]
-pub struct DefLevelsIter<'a> {
-    // current stack for recursion
-    stack: Vec<StackState<'a>>,
-    // current location on stack
-    stack_idx: usize,
-    // the total number of items that this iterator will return
-    remaining_values: usize,
-}
-
-impl<'a> DefLevelsIter<'a> {
-    pub fn new(nested: &'a [Nested]) -> Self {
-        let remaining_values = num_values(nested);
-
-        // Add root node to stack
-        let mut stack = vec![];
-        let mut current_level = 0;
-        let mut null_level = 0;
-        stack.push(
-            StackState {
-                current_level,
-                lengths: Box::new(std::iter::empty()),
-                validity: None,
-                primitive_validity: None,
-                is_optional: 0,
-                is_struct: false,
-                is_primitive: false,
-                null_level,
-                current_length: nested[0].len(),
-            }
-        );
-        for curr_nested in nested {
-            match curr_nested {
-                Nested::Primitive(validity, is_optional, _) => {
-                    let validity_iter;
-                    if let Some(validity) = validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    if let Some(last_stack_item) = stack.last_mut() {
-                        last_stack_item.primitive_validity = validity_iter;
-                        last_stack_item.is_optional = *is_optional as u32;
-                        last_stack_item.is_primitive = true;
-                    } else {
-                        unreachable!();
-                    }
-                }
-                Nested::List(nested) => {
-                    current_level += nested.is_optional as u32 + 1;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = &nested.validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            validity: validity_iter,
-                            primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
-                            null_level,
-                            current_length,
-                        }
-                    );
-                    null_level = current_level;
-                }
-                Nested::LargeList(nested) => {
-                    current_level += nested.is_optional as u32 + 1;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = &nested.validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            validity: validity_iter,
-                            primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
-                            null_level,
-                            current_length,
-                        }
-                    );
-                    null_level = current_level;
-                }
-                Nested::Struct(validity, is_optional, len) => {
-                    current_level += *is_optional as u32;
-                    let mut length_iter = std::iter::repeat(1).take(*len);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            validity: validity_iter,
-                            primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: true,
-                            null_level: null_level,
-                            current_length,
-                        }
-                    );
-                    null_level = current_level;
-                }
-                Nested::FixedSizeList {is_optional, width, len, ..} => {
-                    current_level += *is_optional as u32 + 1;
-                    let mut length_iter = std::iter::repeat(*width).take(*len);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            validity: None,
-                            primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
-                            null_level,
-                            current_length,
-                        }
-                    );
-                    null_level = current_level;
-                }
-            };
-        }
-
-        Self {
-            stack,
-            stack_idx: 0,
-            remaining_values,
-        }
+/// Constructs iterators for def levels of `array`
+pub fn calculate_def_levels(nested: &[Nested]
+) -> PolarsResult<Vec<u32>> {
+    if nested.len() == 0 {
+        return Ok(vec![]);
     }
+    let value_count = num_values(nested);
+    let mut def_levels = Vec::with_capacity(value_count);
+
+    def_levels_recursive(nested, &mut def_levels, 0, 0, nested[0].len())?;
+    Ok(def_levels)
 }
 
-impl<'a> Iterator for DefLevelsIter<'a> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_values == 0 {
-            return None;
-        }
-        let mut stack_state = &mut self.stack[self.stack_idx];
-         // Unwind stack until reaching an unfinished group
-         while stack_state.current_length == 0 {
-            if self.stack_idx == 0 {
-                self.remaining_values -= 1;
-                return Some(0);
-            }
-            // Start next group if current is complete
-            stack_state.current_length = stack_state.lengths.next().unwrap_or(0);
-            self.stack_idx -= 1;
-            stack_state = &mut self.stack[self.stack_idx];
-        }
-        let mut struct_adjustment = 0;
-        loop {
-            stack_state.current_length -= 1;
-            if stack_state.is_primitive {
-                self.remaining_values -= 1;
-                let is_valid;
-                if let Some(validity) = &mut stack_state.primitive_validity {
-                    is_valid = validity.next().unwrap() as u32;
-                } else {
-                    is_valid = stack_state.is_optional;
+fn def_levels_recursive(
+    nested: &[Nested],
+    def_levels: &mut Vec<u32>,
+    current_level: u32,
+    offset: usize,
+    length: usize,
+) -> PolarsResult<()> {
+    let current_nested = &nested[0];
+    match current_nested {
+        Nested::Primitive(validity, is_optional, _) => {
+            match validity {
+                Some(bitmap) => {
+                    let mut bitmap_sliced = bitmap.clone();
+                    bitmap_sliced.slice(offset, length);
+                    def_levels.extend(
+                        bitmap_sliced.iter()
+                            .zip(std::iter::repeat(current_level))
+                            .map(|(is_valid, def_null)| def_null + is_valid as u32)
+                            .take(length));
                 }
-                return Some(stack_state.current_level + is_valid - struct_adjustment);
+                None => {
+                    def_levels.extend(std::iter::repeat(current_level + *is_optional as u32).take(length));
+                }
             }
-            // Advance current group and move deeper into stack
-            self.stack_idx += 1;
-            stack_state = &mut self.stack[self.stack_idx];
-            let is_valid;
-            if let Some(validity) = &mut stack_state.validity {
-                is_valid = validity.next().unwrap() as u32;
-                if stack_state.is_struct {
-                    struct_adjustment += (is_valid == 0) as u32;
+        }
+        Nested::List(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            sliced_offsets.slice(offset, length + 1);
+            // Fields inside lists get extra +1 if defined
+            let next_level = current_level + list_nested.is_optional as u32 + 1;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i);
+                        let inner_length = end - start;
+                        if inner_length == 0 {
+                            // Inner field not defined so no extra +1
+                            def_levels.push(next_level - 1);
+                        } else {
+                            def_levels_recursive(&nested[1..], def_levels, next_level, start, inner_length)?;
+                        }
+                    } else {
+                        def_levels.push(current_level);
+                    }
                 }
             } else {
-                is_valid = stack_state.is_optional;
-            }
-            if stack_state.current_length == 0 {
-                self.remaining_values -= 1;
-                return Some(stack_state.null_level + is_valid - struct_adjustment);
+                for i in 0..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    let inner_length = end - start;
+                    if inner_length == 0 {
+                        // Inner field not defined so no extra +1
+                        def_levels.push(next_level - 1);
+                    } else {
+                        def_levels_recursive(&nested[1..], def_levels, next_level, start, inner_length)?;
+                    }
+                }
             }
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let length = self.remaining_values;
-        (length, Some(length))
-    }
+        Nested::LargeList(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            sliced_offsets.slice(offset, length + 1);
+            // Fields inside lists get extra +1 if defined
+            let next_level = current_level + list_nested.is_optional as u32 + 1;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i);
+                        let inner_length = end - start;
+                        if inner_length == 0 {
+                            // Inner field not defined so no extra +1
+                            def_levels.push(next_level - 1);
+                        } else {
+                            def_levels_recursive(&nested[1..], def_levels, next_level, start, inner_length)?;
+                        }
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    let inner_length = end - start;
+                    if inner_length == 0 {
+                        // Inner field not defined so no extra +1
+                        def_levels.push(next_level - 1);
+                    } else {
+                        def_levels_recursive(&nested[1..], def_levels, next_level, start, inner_length)?;
+                    }
+                }
+            }
+        }
+        Nested::Struct(validity, is_optional, ..) => {
+            let next_level = current_level + *is_optional as u32;
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        def_levels_recursive(&nested[1..], def_levels, next_level, offset + i, 1)?;
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    def_levels_recursive(&nested[1..], def_levels, next_level, offset + i, 1)?;
+                }
+            }
+        }
+        Nested::FixedSizeList {is_optional, width, validity, ..} => {
+            let next_level = current_level + *is_optional as u32;
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        // width > 0 so no need to consider that case
+                        def_levels_recursive(&nested[1..], def_levels, next_level, width * i, *width)?;
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    def_levels_recursive(&nested[1..], def_levels, next_level, width * i, *width)?;
+                }
+            }
+        }
+    };
+    Ok(())
 }
 
 #[cfg(test)]
@@ -240,11 +158,12 @@ mod tests {
     use super::super::super::pages::ListNested;
 
     fn test(nested: Vec<Nested>, expected: Vec<u32>) {
-        let mut iter = DefLevelsIter::new(&nested);
-        assert_eq!(iter.size_hint().0, expected.len());
-        let result = iter.by_ref().collect::<Vec<_>>();
-        assert_eq!(result, expected);
-        assert_eq!(iter.size_hint().0, 0);
+        if let Ok(result) = calculate_def_levels(&nested) {
+            assert_eq!(result.len(), expected.len());
+            assert_eq!(result, expected);
+        } else {
+            panic!("Failed to calculate def levels.")
+        }
     }
 
     #[test]
@@ -533,20 +452,25 @@ mod tests {
 
     #[test]
     fn nested_struct_list_nullable() {
-        let a = [true, false, true, true, true, true, false, true];
+        let a = [
+            true, false, true, true, true, true, false, true, true, true, true, false
+        ];
         let b = [
             true, true, true, false, true, true, true, true, true, true, true, true,
+            true, true, false, true, false, false
         ];
         let nested = vec![
             Nested::Struct(None, true, 12),
             Nested::List(ListNested {
                 is_optional: true,
-                offsets: vec![0, 2, 2, 5, 8, 8, 11, 11, 12].try_into().unwrap(),
+                offsets: vec![0, 2, 2, 5, 8, 8, 11, 11, 12, 13, 15, 18, 18].try_into().unwrap(),
                 validity: Some(a.into()),
             }),
-            Nested::Primitive(Some(b.into()), true, 12),
+            Nested::Primitive(Some(b.into()), true, 18),
         ];
-        let expected = vec![4, 4, 1, 4, 3, 4, 4, 4, 4, 2, 4, 4, 4, 1, 4];
+        let expected = vec![
+            4, 4, 1, 4, 3, 4, 4, 4, 4, 2, 4, 4, 4, 1, 4, 4, 4, 3, 4, 3, 3, 1
+        ];
 
         test(nested, expected)
     }

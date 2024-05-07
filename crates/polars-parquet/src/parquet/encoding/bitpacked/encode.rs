@@ -1,4 +1,4 @@
-use super::{Packed, Unpackable, Unpacked};
+use super::{Unpackable, Unpacked};
 
 /// Encodes (packs) a slice of [`Unpackable`] into bitpacked bytes `packed`, using `num_bits` per value.
 ///
