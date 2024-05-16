@@ -1,223 +1,209 @@
-use arrow::bitmap::Bitmap;
-use arrow::offset::Offset;
-use polars_utils::slice::GetSaferUnchecked;
+use polars_error::PolarsResult;
 
-use super::super::pages::{ListNested, Nested};
-use super::rep::num_values;
-use super::to_length;
+use super::super::pages::Nested;
 
-// (is_valid, length)
-trait DebugIter: Iterator<Item = (u32, usize)> + std::fmt::Debug {}
+/// Constructs iterators for def levels of `array`
+pub fn calculate_def_levels(nested: &[Nested], value_count: usize) -> PolarsResult<Vec<u32>> {
+    if nested.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut def_levels = Vec::with_capacity(value_count);
 
-impl<A: Iterator<Item = (u32, usize)> + std::fmt::Debug> DebugIter for A {}
+    def_levels_recursive(nested, &mut def_levels, 0, 0, nested[0].len())?;
+    Ok(def_levels)
+}
 
-fn single_iter<'a>(
-    validity: &'a Option<Bitmap>,
-    is_optional: bool,
+fn def_levels_recursive(
+    nested: &[Nested],
+    def_levels: &mut Vec<u32>,
+    current_level: u32,
+    offset: usize,
     length: usize,
-) -> Box<dyn DebugIter + 'a> {
-    match (is_optional, validity) {
-        (false, _) => {
-            Box::new(std::iter::repeat((0u32, 1usize)).take(length)) as Box<dyn DebugIter>
-        },
-        (true, None) => {
-            Box::new(std::iter::repeat((1u32, 1usize)).take(length)) as Box<dyn DebugIter>
-        },
-        (true, Some(validity)) => {
-            Box::new(validity.iter().map(|v| (v as u32, 1usize)).take(length)) as Box<dyn DebugIter>
-        },
-    }
-}
-
-fn single_list_iter<'a, O: Offset>(nested: &'a ListNested<O>) -> Box<dyn DebugIter + 'a> {
-    match (nested.is_optional, &nested.validity) {
-        (false, _) => Box::new(
-            std::iter::repeat(0u32)
-                .zip(to_length(&nested.offsets))
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-        (true, None) => Box::new(
-            std::iter::repeat(1u32)
-                .zip(to_length(&nested.offsets))
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-        (true, Some(validity)) => Box::new(
-            validity
-                .iter()
-                .map(|x| (x as u32))
-                .zip(to_length(&nested.offsets))
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-    }
-}
-
-fn single_fixed_list_iter<'a>(
-    width: usize,
-    is_optional: bool,
-    validity: Option<&'a Bitmap>,
-    len: usize,
-) -> Box<dyn DebugIter + 'a> {
-    let lengths = std::iter::repeat(width).take(len);
-    match (is_optional, validity) {
-        (false, _) => Box::new(
-            std::iter::repeat(0u32)
-                .zip(lengths)
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-        (true, None) => Box::new(
-            std::iter::repeat(1u32)
-                .zip(lengths)
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-        (true, Some(validity)) => Box::new(
-            validity
-                .iter()
-                .map(|x| (x as u32))
-                .zip(lengths)
-                .map(|(a, b)| (a + (b != 0) as u32, b)),
-        ) as Box<dyn DebugIter>,
-    }
-}
-
-fn iter<'a>(nested: &'a [Nested]) -> Vec<Box<dyn DebugIter + 'a>> {
-    nested
-        .iter()
-        .map(|nested| match nested {
-            Nested::Primitive(validity, is_optional, length) => {
-                single_iter(validity, *is_optional, *length)
+) -> PolarsResult<()> {
+    let current_nested = &nested[0];
+    match current_nested {
+        Nested::Primitive(validity, is_optional, _) => match validity {
+            Some(bitmap) => {
+                let mut bitmap_sliced = bitmap.clone();
+                bitmap_sliced.slice(offset, length);
+                def_levels.extend(
+                    bitmap_sliced
+                        .iter()
+                        .zip(std::iter::repeat(current_level))
+                        .map(|(is_valid, def_null)| def_null + is_valid as u32)
+                        .take(length),
+                );
             },
-            Nested::List(nested) => single_list_iter(nested),
-            Nested::LargeList(nested) => single_list_iter(nested),
-            Nested::Struct(validity, is_optional, length) => {
-                single_iter(validity, *is_optional, *length)
+            None => {
+                def_levels
+                    .extend(std::iter::repeat(current_level + *is_optional as u32).take(length));
             },
-            Nested::FixedSizeList {
-                validity,
-                is_optional,
-                len,
-                width,
-                ..
-            } => single_fixed_list_iter(*width, *is_optional, validity.as_ref(), *len),
-        })
-        .collect()
-}
-
-/// Iterator adapter of parquet / dremel definition levels
-#[derive(Debug)]
-pub struct DefLevelsIter<'a> {
-    // iterators of validities and lengths. E.g. [[[None,b,c], None], None] -> [[(true, 2), (false, 0)], [(true, 3), (false, 0)], [(false, 1), (true, 1), (true, 1)]]
-    iter: Vec<Box<dyn DebugIter + 'a>>,
-    // vector containing the remaining number of values of each iterator.
-    // e.g. the iters [[2, 2], [3, 4, 1, 2]] after the first iteration will return [2, 3],
-    // and remaining will be [2, 3].
-    // on the second iteration, it will be `[2, 2]` (since iterations consume the last items)
-    remaining: Vec<usize>, /* < remaining.len() == iter.len() */
-    validity: Vec<u32>,
-    // cache of the first `remaining` that is non-zero. Examples:
-    // * `remaining = [2, 2] => current_level = 2`
-    // * `remaining = [2, 0] => current_level = 1`
-    // * `remaining = [0, 0] => current_level = 0`
-    current_level: usize, /* < iter.len() */
-    // the total definition level at any given point during the iteration
-    total: u32, /* < iter.len() */
-    // the total number of items that this iterator will return
-    remaining_values: usize,
-}
-
-impl<'a> DefLevelsIter<'a> {
-    pub fn new(nested: &'a [Nested]) -> Self {
-        let remaining_values = num_values(nested);
-
-        let iter = iter(nested);
-        let remaining = vec![0; iter.len()];
-        let validity = vec![0; iter.len()];
-
-        Self {
-            iter,
-            remaining,
-            validity,
-            total: 0,
-            current_level: 0,
-            remaining_values,
-        }
-    }
-}
-
-impl<'a> Iterator for DefLevelsIter<'a> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining_values == 0 {
-            return None;
-        }
-
-        if self.remaining.is_empty() {
-            self.remaining_values -= 1;
-            return Some(0);
-        }
-
-        let mut empty_contrib = 0u32;
-        for ((iter, remaining), validity) in self
-            .iter
-            .iter_mut()
-            .zip(self.remaining.iter_mut())
-            .zip(self.validity.iter_mut())
-            .skip(self.current_level)
-        {
-            let (is_valid, length): (u32, usize) = iter.next()?;
-            *validity = is_valid;
-            self.total += is_valid;
-
-            *remaining = length;
-            if length == 0 {
-                *validity = 0;
-                self.total -= is_valid;
-                empty_contrib = is_valid;
-                break;
-            }
-            self.current_level += 1;
-        }
-
-        // track
-        if let Some(x) = self.remaining.get_mut(self.current_level.saturating_sub(1)) {
-            *x = x.saturating_sub(1)
-        }
-
-        let r = Some(self.total + empty_contrib);
-
-        for index in (1..self.current_level).rev() {
-            unsafe {
-                if *self.remaining.get_unchecked_release(index) == 0 {
-                    self.current_level -= 1;
-                    *self.remaining.get_unchecked_release_mut(index - 1) -= 1;
-                    self.total -= *self.validity.get_unchecked_release(index);
+        },
+        Nested::List(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            // Inner values are already sliced so subtract first offset
+            let first_offset = *sliced_offsets.first() as usize;
+            sliced_offsets.slice(offset, length + 1);
+            // Fields inside lists get extra +1 if defined
+            let next_level = current_level + list_nested.is_optional as u32 + 1;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i);
+                        let inner_length = end - start;
+                        if inner_length == 0 {
+                            // Inner field not defined so no extra +1
+                            def_levels.push(next_level - 1);
+                        } else {
+                            def_levels_recursive(
+                                &nested[1..],
+                                def_levels,
+                                next_level,
+                                start - first_offset,
+                                inner_length,
+                            )?;
+                        }
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    let inner_length = end - start;
+                    if inner_length == 0 {
+                        // Inner field not defined so no extra +1
+                        def_levels.push(next_level - 1);
+                    } else {
+                        def_levels_recursive(
+                            &nested[1..],
+                            def_levels,
+                            next_level,
+                            start - first_offset,
+                            inner_length,
+                        )?;
+                    }
                 }
             }
-        }
-        if self.remaining[0] == 0 {
-            self.current_level = self.current_level.saturating_sub(1);
-            self.total -= unsafe { self.validity.get_unchecked_release(0) };
-        }
-        self.remaining_values -= 1;
-        r
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let length = self.remaining_values;
-        (length, Some(length))
-    }
+        },
+        Nested::LargeList(list_nested) => {
+            let mut sliced_offsets = list_nested.offsets.clone();
+            // Inner values are already sliced so subtract first offset
+            let first_offset = *sliced_offsets.first() as usize;
+            sliced_offsets.slice(offset, length + 1);
+            // Fields inside lists get extra +1 if defined
+            let next_level = current_level + list_nested.is_optional as u32 + 1;
+            if let Some(bitmap) = &list_nested.validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        let (start, end) = sliced_offsets.start_end(i);
+                        let inner_length = end - start;
+                        if inner_length == 0 {
+                            // Inner field not defined so no extra +1
+                            def_levels.push(next_level - 1);
+                        } else {
+                            def_levels_recursive(
+                                &nested[1..],
+                                def_levels,
+                                next_level,
+                                start - first_offset,
+                                inner_length,
+                            )?;
+                        }
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    let (start, end) = sliced_offsets.start_end(i);
+                    let inner_length = end - start;
+                    if inner_length == 0 {
+                        // Inner field not defined so no extra +1
+                        def_levels.push(next_level - 1);
+                    } else {
+                        def_levels_recursive(
+                            &nested[1..],
+                            def_levels,
+                            next_level,
+                            start - first_offset,
+                            inner_length,
+                        )?;
+                    }
+                }
+            }
+        },
+        Nested::Struct(validity, is_optional, ..) => {
+            let next_level = current_level + *is_optional as u32;
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        def_levels_recursive(&nested[1..], def_levels, next_level, offset + i, 1)?;
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    def_levels_recursive(&nested[1..], def_levels, next_level, offset + i, 1)?;
+                }
+            }
+        },
+        Nested::FixedSizeList {
+            is_optional,
+            width,
+            validity,
+            ..
+        } => {
+            // Fields inside lists get extra +1 if defined
+            let next_level = current_level + *is_optional as u32 + 1;
+            if let Some(bitmap) = validity {
+                let mut sliced_bitmap = bitmap.clone();
+                sliced_bitmap.slice(offset, length);
+                for (i, is_valid) in sliced_bitmap.iter().enumerate() {
+                    if is_valid {
+                        // width > 0 so no need to consider that case
+                        def_levels_recursive(
+                            &nested[1..],
+                            def_levels,
+                            next_level,
+                            width * i,
+                            *width,
+                        )?;
+                    } else {
+                        def_levels.push(current_level);
+                    }
+                }
+            } else {
+                for i in 0..length {
+                    def_levels_recursive(&nested[1..], def_levels, next_level, width * i, *width)?;
+                }
+            }
+        },
+    };
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::pages::ListNested;
+    use super::super::rep::num_values;
     use super::*;
 
     fn test(nested: Vec<Nested>, expected: Vec<u32>) {
-        let mut iter = DefLevelsIter::new(&nested);
-        assert_eq!(iter.size_hint().0, expected.len());
-        let result = iter.by_ref().collect::<Vec<_>>();
-        assert_eq!(result, expected);
-        assert_eq!(iter.size_hint().0, 0);
+        let value_count = num_values(&nested);
+        if let Ok(result) = calculate_def_levels(&nested, value_count) {
+            assert_eq!(result.len(), expected.len());
+            assert_eq!(result, expected);
+        } else {
+            panic!("Failed to calculate def levels.")
+        }
     }
 
     #[test]
@@ -506,20 +492,27 @@ mod tests {
 
     #[test]
     fn nested_struct_list_nullable() {
-        let a = [true, false, true, true, true, true, false, true];
+        let a = [
+            true, false, true, true, true, true, false, true, true, true, true, false,
+        ];
         let b = [
-            true, true, true, false, true, true, true, true, true, true, true, true,
+            true, true, true, false, true, true, true, true, true, true, true, true, true, true,
+            false, true, false, false,
         ];
         let nested = vec![
             Nested::Struct(None, true, 12),
             Nested::List(ListNested {
                 is_optional: true,
-                offsets: vec![0, 2, 2, 5, 8, 8, 11, 11, 12].try_into().unwrap(),
+                offsets: vec![0, 2, 2, 5, 8, 8, 11, 11, 12, 13, 15, 18, 18]
+                    .try_into()
+                    .unwrap(),
                 validity: Some(a.into()),
             }),
-            Nested::Primitive(Some(b.into()), true, 12),
+            Nested::Primitive(Some(b.into()), true, 18),
         ];
-        let expected = vec![4, 4, 1, 4, 3, 4, 4, 4, 4, 2, 4, 4, 4, 1, 4];
+        let expected = vec![
+            4, 4, 1, 4, 3, 4, 4, 4, 4, 2, 4, 4, 4, 1, 4, 4, 4, 3, 4, 3, 3, 1,
+        ];
 
         test(nested, expected)
     }
