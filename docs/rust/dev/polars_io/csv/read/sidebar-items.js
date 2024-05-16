@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CommentPrefix","CsvEncoding","NullValues"],"fn":["count_rows","infer_file_schema","is_compressed"],"struct":["BatchedCsvReader","CsvParseOptions","CsvReadOptions","CsvReader","OwnedBatchedCsvReader"]};
