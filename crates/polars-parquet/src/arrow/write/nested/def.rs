@@ -7,20 +7,24 @@ use super::to_length;
 /// Store information about recursive stack
 #[derive(Debug)]
 pub struct StackState<'a> {
-    // current repetition level
+    // current definition level
     pub current_level: u32,
+    // iterator over validities of inner values
+    pub validity: Option<BitmapIter<'a>>,
+    // add to null level when inner field is defined with 0 length
+    pub is_optional: u32,
     // iterator over lengths of inner values
     pub lengths: Box<dyn DebugIter + 'a>,
-    pub is_struct: bool,
-    // validity iterator (only for leaf primitive arrays)
+    // iterator over validities of inner primitive array
     pub primitive_validity: Option<BitmapIter<'a>>,
-    pub validity: Option<BitmapIter<'a>>,
-    pub is_optional: u32,
+    // add to current level when inner primitive field defined with no validity
+    pub primitive_is_optional: u32,
+    // whether next level is primitive array
     pub is_primitive: bool,
-    // calculate def level differently for structs
+    // definition level if field is null
     pub null_level: u32,
-    // remaining length of current inner value
-    pub current_length: usize
+    // remaining length of current inner field value
+    pub current_length: usize,
 }
 
 /// Iterator adapter of parquet / dremel definition levels
@@ -48,8 +52,8 @@ impl<'a> DefLevelsIter<'a> {
                 lengths: Box::new(std::iter::empty()),
                 validity: None,
                 primitive_validity: None,
+                primitive_is_optional: 0,
                 is_optional: 0,
-                is_struct: false,
                 is_primitive: false,
                 null_level,
                 current_length: nested[0].len(),
@@ -66,7 +70,7 @@ impl<'a> DefLevelsIter<'a> {
                     }
                     if let Some(last_stack_item) = stack.last_mut() {
                         last_stack_item.primitive_validity = validity_iter;
-                        last_stack_item.is_optional = *is_optional as u32;
+                        last_stack_item.primitive_is_optional = *is_optional as u32;
                         last_stack_item.is_primitive = true;
                     } else {
                         unreachable!();
@@ -89,8 +93,8 @@ impl<'a> DefLevelsIter<'a> {
                             is_primitive: false,
                             validity: validity_iter,
                             primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
+                            primitive_is_optional: 0,
+                            is_optional: nested.is_optional as u32,
                             null_level,
                             current_length,
                         }
@@ -114,8 +118,8 @@ impl<'a> DefLevelsIter<'a> {
                             is_primitive: false,
                             validity: validity_iter,
                             primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
+                            primitive_is_optional: 0,
+                            is_optional: nested.is_optional as u32,
                             null_level,
                             current_length,
                         }
@@ -139,9 +143,9 @@ impl<'a> DefLevelsIter<'a> {
                             is_primitive: false,
                             validity: validity_iter,
                             primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: true,
-                            null_level: null_level,
+                            primitive_is_optional: 0,
+                            is_optional: *is_optional as u32,
+                            null_level,
                             current_length,
                         }
                     );
@@ -158,8 +162,8 @@ impl<'a> DefLevelsIter<'a> {
                             is_primitive: false,
                             validity: None,
                             primitive_validity: None,
-                            is_optional: 0,
-                            is_struct: false,
+                            primitive_is_optional: 0,
+                            is_optional: *is_optional as u32,
                             null_level,
                             current_length,
                         }
@@ -196,7 +200,7 @@ impl<'a> Iterator for DefLevelsIter<'a> {
             self.stack_idx -= 1;
             stack_state = &mut self.stack[self.stack_idx];
         }
-        let mut struct_adjustment = 0;
+        let mut not_valid_level = 0;
         loop {
             stack_state.current_length -= 1;
             if stack_state.is_primitive {
@@ -205,9 +209,12 @@ impl<'a> Iterator for DefLevelsIter<'a> {
                 if let Some(validity) = &mut stack_state.primitive_validity {
                     is_valid = validity.next().unwrap() as u32;
                 } else {
-                    is_valid = stack_state.is_optional;
+                    is_valid = stack_state.primitive_is_optional;
                 }
-                return Some(stack_state.current_level + is_valid - struct_adjustment);
+                if not_valid_level > 0 {
+                    return Some(not_valid_level);
+                }
+                return Some(stack_state.current_level + is_valid);
             }
             // Advance current group and move deeper into stack
             self.stack_idx += 1;
@@ -215,15 +222,22 @@ impl<'a> Iterator for DefLevelsIter<'a> {
             let is_valid;
             if let Some(validity) = &mut stack_state.validity {
                 is_valid = validity.next().unwrap() as u32;
-                if stack_state.is_struct {
-                    struct_adjustment += (is_valid == 0) as u32;
+                // After encountering a field that is null, we must still
+                // recursively traverse inner fields (decrementing lengths and
+                // and advancing validity iterators), but the definition level
+                // that is returned is fixed at the level above the null field.
+                if is_valid == 0 && not_valid_level == 0 {
+                    not_valid_level = stack_state.null_level;
                 }
             } else {
                 is_valid = stack_state.is_optional;
             }
             if stack_state.current_length == 0 {
                 self.remaining_values -= 1;
-                return Some(stack_state.null_level + is_valid - struct_adjustment);
+                if not_valid_level > 0 {
+                    return Some(not_valid_level);
+                }
+                return Some(stack_state.null_level + is_valid);
             }
         }
     }
