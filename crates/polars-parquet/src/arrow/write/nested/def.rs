@@ -196,6 +196,9 @@ mod tests {
     use super::super::rep::num_values;
     use super::*;
 
+    use test::Bencher;
+    use arrow::bitmap::Bitmap;
+
     fn test(nested: Vec<Nested>, expected: Vec<u32>) {
         let value_count = num_values(&nested);
         if let Ok(result) = calculate_def_levels(&nested, value_count) {
@@ -613,5 +616,55 @@ mod tests {
         let expected = vec![6, 6, 0, 6, 2, 6, 3, 3, 3, 1, 6, 5, 6, 6, 0, 4];
 
         test(nested, expected)
+    }
+
+    #[bench]
+    fn bench_mega_nested(b: &mut Bencher) {
+        let nested = vec![
+            Nested::List(ListNested {
+                is_optional: true,
+                offsets: vec![1, 2, 0, 3].iter()
+                    .cycle()
+                    .take(4 * 1000)
+                    .scan(0, |state, &x| { *state += x; Some(*state) })
+                    .collect::<Vec<i32>>()
+                    .try_into()
+                    .unwrap(),
+                validity: None,
+            }),
+            Nested::Struct(None, true, 6000),
+            Nested::List(ListNested {
+                is_optional: true,
+                offsets: vec![1, 2, 0, 2].iter()
+                    .cycle()
+                    .take(6000)
+                    .scan(0, |state, &x| { *state += x; Some(*state) })
+                    .collect::<Vec<i32>>()
+                    .try_into()
+                    .unwrap(),
+                validity: None,
+            }),
+            Nested::Struct(
+                Some(Bitmap::try_new([1u8, 1, 0, 0, 1].into_iter()
+                    .cycle()
+                    .take(7500)
+                    .collect::<Vec<u8>>(), 7500)
+                    .unwrap()),
+                true, 7500),
+            Nested::List(ListNested {
+                is_optional: true,
+                offsets: vec![1, 1, 0, 0, 1].iter()
+                    .cycle()
+                    .take(7500)
+                    .scan(0, |state, &x| { *state += x; Some(*state) })
+                    .collect::<Vec<i32>>()
+                    .try_into()
+                    .unwrap(),
+                validity: None,
+            }),
+            Nested::Primitive(None, true, 4500),
+        ];
+        let value_count = num_values(&nested);
+        b.iter(|| calculate_def_levels(&nested, value_count).unwrap());
     }
 }
