@@ -1,5 +1,3 @@
-use arrow::bitmap::utils::BitmapIter;
-
 use super::super::pages::Nested;
 use super::to_length;
 
@@ -47,18 +45,16 @@ pub fn num_values(nested: &[Nested]) -> usize {
 /// Store information about recursive stack
 #[derive(Debug)]
 pub struct StackState<'a> {
+    // Information about nested level
+    pub nested: &'a Nested,
     // current repetition level
     pub current_level: u32,
-    // iterator over lengths of inner values
-    pub lengths: Box<dyn DebugIter + 'a>,
-    // whether next level is primitive array
-    pub is_primitive: bool,
-    // remaining length of current inner value
+    // offset to slice inner level by
+    pub offset: usize,
+    // number of consecutive values at level
     pub current_length: usize,
-    // whether on first value of level
-    pub first_value: bool,
-    // iterator over validities of inner values
-    pub validity: Option<BitmapIter<'a>>,
+    // number of consecutive values processed at level,
+    pub processed_length: usize,
 }
 
 /// Iterator adapter of parquet / dremel repetition levels
@@ -75,113 +71,34 @@ pub struct RepLevelsIter<'a> {
 impl<'a> RepLevelsIter<'a> {
     pub fn new(nested: &'a [Nested]) -> Self {
         let remaining_values = num_values(nested);
-
-        // Add root node to stack
         let mut stack = vec![];
         let mut current_level = 0;
-        stack.push(
-            StackState {
-                current_level,
-                lengths: Box::new(std::iter::empty()),
-                is_primitive: false,
-                current_length: nested[0].len(),
-                first_value: true,
-                validity: None,
-            }
-        );
+        let mut current_length = nested[0].len();
         for curr_nested in nested {
-            match curr_nested {
-                Nested::Primitive(_, _, _) => {
-                    if let Some(last_stack_item) = stack.last_mut() {
-                        last_stack_item.is_primitive = true;
-                    } else {
-                        unreachable!();
-                    }
+            stack.push(
+                StackState {
+                    nested: curr_nested,
+                    current_level,
+                    offset: 0,
+                    current_length,
+                    processed_length: 0,
                 }
+            );
+            match curr_nested {
+                Nested::Primitive(_, _, _) => (),
                 Nested::List(nested) => {
                     current_level += nested.is_optional as u32;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = &nested.validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            first_value: true,
-                            validity: validity_iter,
-                        }
-                    );
+                    current_length = to_length(&nested.offsets).next().unwrap_or(0);
                 }
-                Nested::LargeList(nested) => {
+                Nested::LargeList(nested) =>{
                     current_level += nested.is_optional as u32;
-                    let mut length_iter = to_length(&nested.offsets);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = &nested.validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            first_value: true,
-                            validity: validity_iter,
-                        }
-                    );
+                    current_length = to_length(&nested.offsets).next().unwrap_or(0);
                 }
-                // Struct fields are ignored for rep level calculations
-                Nested::Struct(validity, is_optional, len) => {
-                    let mut length_iter = std::iter::repeat(1).take(*len);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            first_value: true,
-                            validity: validity_iter,
-                        }
-                    );
-                },
-                Nested::FixedSizeList {validity, is_optional, width, len} => {
+                Nested::FixedSizeList {is_optional, width, len, ..} => {
                     current_level += *is_optional as u32;
-                    let mut length_iter = std::iter::repeat(*width).take(*len);
-                    let current_length = length_iter.next().unwrap_or(0);
-                    let validity_iter;
-                    if let Some(validity) = validity {
-                        validity_iter = Some(validity.iter());
-                    } else {
-                        validity_iter = None;
-                    }
-                    stack.push(
-                        StackState {
-                            current_level,
-                            lengths: Box::new(length_iter),
-                            is_primitive: false,
-                            current_length,
-                            first_value: true,
-                            validity: validity_iter,
-                        }
-                    );
+                    current_length = if *len > 0 { *width } else { 0 };
                 }
+                Nested::Struct(..) => current_length = 1,
             };
         }
 
@@ -202,52 +119,88 @@ impl<'a> Iterator for RepLevelsIter<'a> {
         }
         let mut stack_state = &mut self.stack[self.stack_idx];
         // Unwind stack until reaching an unfinished group
-        while stack_state.current_length == 0 {
-            if self.stack_idx == 0 {
-                self.remaining_values -= 1;
-                return Some(0);
-            }
-            // Start next group if current is complete
-            stack_state.current_length = stack_state.lengths.next().unwrap_or(0);
-            stack_state.first_value = true;
+        while stack_state.current_length == stack_state.processed_length {
+            stack_state.processed_length = 0;
             self.stack_idx -= 1;
             stack_state = &mut self.stack[self.stack_idx];
         }
         // Outer level is most recent ancestor of previous and current value
         let outer_level = stack_state.current_level;
-        let mut not_valid_level = 0;
+        self.remaining_values -= 1;
         loop {
-            stack_state.current_length -= 1;
-            if stack_state.is_primitive {
-                self.remaining_values -= 1;
-                // If first value of this level, return outer level
-                if stack_state.first_value {
-                    stack_state.first_value = false;
-                    return Some(outer_level);
-                } else if not_valid_level > 0 {
-                    return Some(not_valid_level);
+            stack_state.processed_length += 1;
+            stack_state.offset += 1;
+            let inner_offset;
+            let inner_length;
+            match stack_state.nested {
+                Nested::Primitive(..) => {
+                    if stack_state.processed_length == 1 {
+                        return Some(outer_level);
+                    }
+                    return Some(stack_state.current_level);
                 }
-                return Some(stack_state.current_level);
+                Nested::List(list_nested) => {
+                    if let Some(bitmap) = &list_nested.validity {
+                        if !bitmap.get_bit(stack_state.offset - 1) {
+                            if stack_state.processed_length == 1 {
+                                return Some(outer_level);
+                            } else {
+                                return Some(stack_state.current_level);
+                            }
+                        }
+                    }
+                    let first_offset = *list_nested.offsets.first() as usize;
+                    let (start, end) = list_nested.offsets.start_end(stack_state.offset - 1);
+                    inner_offset = start - first_offset;
+                    inner_length = end  - start;
+                }
+                Nested::LargeList(list_nested) => {
+                    if let Some(bitmap) = &list_nested.validity {
+                        if !bitmap.get_bit(stack_state.offset - 1) {
+                            if stack_state.processed_length == 1 {
+                                return Some(outer_level);
+                            } else {
+                                return Some(stack_state.current_level);
+                            }
+                        }
+                    }
+                    let first_offset = *list_nested.offsets.first() as usize;
+                    let (start, end) = list_nested.offsets.start_end(stack_state.offset - 1);
+                    inner_offset = start - first_offset;
+                    inner_length = end  - start;
+                }
+                Nested::Struct(validity, ..) => {
+                    if let Some(bitmap) = validity {
+                        if !bitmap.get_bit(stack_state.offset - 1) {
+                            if stack_state.processed_length == 1 {
+                                return Some(outer_level);
+                            } else {
+                                return Some(stack_state.current_level);
+                            }
+                        }
+                    }
+                    inner_offset = stack_state.offset - 1;
+                    inner_length = 1;
+                }
+                Nested::FixedSizeList{ validity, width, .. } => {
+                    if let Some(bitmap) = validity {
+                        if !bitmap.get_bit(stack_state.offset - 1) {
+                            if stack_state.processed_length == 1 {
+                                return Some(outer_level);
+                            } else {
+                                return Some(stack_state.current_level);
+                            }
+                        }
+                    }
+                    inner_offset = *width * (stack_state.processed_length - 1);
+                    inner_length = *width;
+                }
             }
-            stack_state.first_value = false;
             self.stack_idx += 1;
             stack_state = &mut self.stack[self.stack_idx];
-            if let Some(validity) = &mut stack_state.validity {
-                // After encountering a field that is null, we must still
-                // recursively traverse inner fields (decrementing lengths and
-                // and advancing validity iterators), but the repetition level
-                // that is returned (if not first value of level) is fixed at
-                // current level.
-                if !validity.next().unwrap() && not_valid_level == 0 {
-                    not_valid_level = stack_state.current_level;
-                }
-            }
-            // Repetition level for null is always outer level
-            if stack_state.current_length == 0 {
-                self.remaining_values -= 1;
-                if not_valid_level > 0 {
-                    return Some(not_valid_level);
-                }
+            stack_state.offset = inner_offset;
+            stack_state.current_length = inner_length;
+            if inner_length == 0 {
                 return Some(outer_level);
             }
         }
@@ -433,12 +386,12 @@ mod tests {
             Nested::Struct(None, true, 12),
             Nested::List(ListNested {
                 is_optional: true,
-                offsets: vec![0, 1, 2, 3, 3, 4, 4, 4, 4, 5, 6, 8].try_into().unwrap(),
+                offsets: vec![0, 1, 2, 3, 3, 4, 4, 4, 4, 5, 6, 8, 8].try_into().unwrap(),
                 validity: None,
             }),
             Nested::Primitive(None, true, 8),
         ];
-        let expected = vec![0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 2, 0];
+        let expected = vec![0, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 1, 1, 2, 0, 0];
 
         test(nested, expected)
     }
